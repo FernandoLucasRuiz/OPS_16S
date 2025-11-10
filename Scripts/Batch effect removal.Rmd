@@ -1,0 +1,1173 @@
+---
+title: "Ajustar Batch effect"
+author: "Fernando Lucas Ruiz (fernando.lucas@um.es)"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    df_print: paged
+    highlight: kate
+    number_sections: true
+    theme: spacelab
+    toc: true
+    toc_float: true
+    code_folding: "hide"
+  pdf_document:
+    toc: true
+subtitle: Cirugía digestiva, endocrina y trasplante de órganos abdominales (IMIB)
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = T, warning = F, message = F)
+```
+
+```{r}
+source("../Librerias.R")
+source("../utils.R")
+otus_lp_t1_t3 <- readRDS("../../RDSs/paper/otus_lp_t1_t3.RDS") 
+
+otus_bilis <- readRDS("../../RDSs/paper/otus_bilis.RDS")
+otus_negative_controls <- readRDS("../../RDSs/paper/otus_negative_controls.RDS")
+covs <- readRDS("../../RDSs/paper/covs.RDS")
+```
+
+# Preparar datos
+## Colapsar taxonomia para random ids
+
+```{r}
+taxonomia_combinada_lp_t1_t3 <- otus_lp_t1_t3 %>%
+    unite("Combined", Phylum:Species, sep = "_", remove = F)
+taxonomia_combinada_bilis <- otus_bilis %>%
+    unite("Combined", Phylum:Species, sep = "_", remove = F)
+taxonomia_combinada_negative_controls <- otus_negative_controls %>%
+    unite("Combined", Phylum:Species, sep = "_", remove = F)
+
+
+taxonomia_combinada <- rbind(taxonomia_combinada_lp_t1_t3[,1:6], taxonomia_combinada_bilis[,1:6], taxonomia_combinada_negative_controls[,1:6]) 
+
+taxonos <- unique(taxonomia_combinada$Combined)
+set.seed(123)  # Para reproducibilidad
+random_ids <- replicate(length(taxonos), {
+  first_letter <- sample(letters, 1)  # Seleccionar una letra para el primer carácter
+  rest <- sample(c(letters, 0:9), 15, replace = TRUE)  # Generar el resto del ID
+  paste(c(first_letter, rest), collapse = "")  # Combinar la letra con el resto
+})
+
+taxonos_ids <- data.frame(cbind(taxonos, random_ids))
+
+# juntar taxonos_ids a todas_muestras 
+otus_lp_t1_t3_combined <- dplyr::left_join(taxonomia_combinada_lp_t1_t3, taxonos_ids, by = c("Combined" = "taxonos"))
+otus_bilis_combined <- dplyr::left_join(taxonomia_combinada_bilis, taxonos_ids, by = c("Combined" = "taxonos"))
+otus_negative_controls_combined <- dplyr::left_join(taxonomia_combinada_negative_controls, taxonos_ids, by = c("Combined" = "taxonos"))
+```
+
+## Controles negativos
+
+```{r}
+abundance_table_negative_control <- otus_negative_controls_combined %>%
+        dplyr::group_by(random_ids, codigo) %>%
+        dplyr::summarize(Count = sum(as.numeric(Count), na.rm = TRUE)) %>%
+        ungroup() %>%
+        pivot_wider(names_from = codigo, values_from = Count) %>%
+        mutate_all(~replace_na(., 0))
+    
+abundance_table_negative_control <- as.data.frame(abundance_table_negative_control)
+rownames(abundance_table_negative_control) <- abundance_table_negative_control$random_ids
+abundance_table_negative_control <- abundance_table_negative_control %>% dplyr::select(-random_ids)
+```
+
+```{r}
+samples_LP <- otus_lp_t1_t3_combined %>%
+    dplyr::filter(tipo_muestra == "LP") 
+
+pretse_LP <- prepare_TSE_data(samples_LP, covs)
+ncol(pretse_LP$abundance_table)
+nrow(pretse_LP$samples_metadata)
+```
+
+## Quitar contaminación
+
+```{r}
+otu_combined <- merge(as.data.frame(pretse_LP$abundance_table), as.data.frame(abundance_table_negative_control), by = "row.names", all = TRUE)
+rownames(otu_combined) <- otu_combined$Row.names
+otu_combined$Row.names <- NULL
+
+# Reemplazar los valores NA por ceros en la matriz combinada
+otu_combined[is.na(otu_combined)] <- 0
+
+# Crear un vector que indique qué columnas son controles (TRUE = control, FALSE = muestra real)
+is_control <- c(rep(FALSE, ncol(as.data.frame(pretse_LP$abundance_table))), rep(TRUE, ncol(as.data.frame(abundance_table_negative_control))))
+
+# Usar decontam para identificar contaminantes basados en prevalencia
+contaminants_prev <- isContaminant(as.matrix(otu_combined), method = "prevalence", neg = is_control) %>%
+    filter(contaminant == TRUE & p < 0.05)
+
+head(contaminants_prev)
+```
+
+```{r}
+
+if (nrow(contaminants_prev) != 0){
+    pretse_LP$abundance_table <- pretse_LP$abundance_table %>% 
+        as.data.frame() %>%
+        dplyr::select(-rownames(contaminants_prev))
+    
+    pretse_LP$samples_metadata <- pretse_LP$samples_metadata[rownames(pretse_LP$samples_metadata) != rownames(contaminants_prev),]
+}
+
+ncol(pretse_LP$abundance_table)
+nrow(pretse_LP$samples_metadata)
+```
+
+## Crear dataframe guardar estadistica Permanovas
+
+```{r}
+estadisitica_ajuste_batch_df <- data.frame()
+```
+
+# Sin ajustar
+
+## Bray
+
+```{r}
+# Calcular la matriz de distancia usando Bray-Curtis
+distance_matrix <- vegdist(t(pretse_LP$abundance_table), method = "bray")
+
+# Realizar el PCoA
+pcoa_result <- cmdscale(distance_matrix, k = 2, eig = TRUE)
+
+# Crear un data.frame con los resultados y añadir la información del batch
+pcoa_data <- as.data.frame(pcoa_result$points)
+colnames(pcoa_data) <- c("PCoA1", "PCoA2")
+pcoa_data$batch <- pretse_LP$samples_metadata$Batch
+
+centroids <- pcoa_data %>%
+  dplyr::group_by(batch) %>%
+  dplyr::summarize(PCoA1 = mean(PCoA1, na.rm = TRUE),
+            PCoA2 = mean(PCoA2, na.rm = TRUE))
+ 
+plot_a <- ggplot(pcoa_data, aes(x = PCoA1, y = PCoA2, color = batch)) +
+    geom_point(size = 2) +
+    scale_color_manual(values = paletteer_d("ggthemes::wsj_rgby")) +
+    scale_fill_manual(values = paletteer_d("ggthemes::wsj_rgby")) + 
+    labs(title = "PCoA Bray-Curtis", 
+         x = paste("PCoA1",round(pcoa_result$eig[1], 2), "%"), 
+         y = paste("PCoA2",round(pcoa_result$eig[2], 2), "%"), 
+         color = "Batch") +
+    theme_minimal()+ 
+    theme(
+        axis.text = element_blank()
+    ) +
+    stat_ellipse(show.legend = F) +
+    geom_point(data = centroids, size = 5, shape = 21, color = "black",
+               aes(fill = batch), show.legend = F)
+
+
+plot_a
+```
+
+## UMAP
+
+```{r}
+library(umap)
+abundancia_norm <- decostand(t(pretse_LP$abundance_table), method = "hellinger")
+
+set.seed(123)  # Para resultados reproducibles
+
+# Usando el paquete umap
+umap_result <- umap(abundancia_norm)
+
+# Usando uwot (opción más rápida y flexible)
+umap_result <- umap(abundancia_norm, n_neighbors = 15, min_dist = 0.1, metric = "euclidean")
+
+# Convertir resultado a dataframe
+umap_df <- data.frame(
+  UMAP1 = umap_result$layout[,1],
+  UMAP2 = umap_result$layout[,2],
+  Muestra = rownames(t(pretse_LP$abundance_table)),
+  batch = pretse_LP$samples_metadata$Batch
+  
+)
+
+centroids <- umap_df %>%
+  dplyr::group_by(batch) %>%
+  dplyr::summarize(UMAP1 = mean(UMAP1, na.rm = TRUE),
+            UMAP2 = mean(UMAP2, na.rm = TRUE))
+
+# Graficar
+plot_umap_noajustado <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = batch)) +
+   geom_point(size = 2) +
+    scale_color_manual(values = paletteer_d("ggthemes::wsj_rgby")) +
+    scale_fill_manual(values = paletteer_d("ggthemes::wsj_rgby")) + 
+    labs(title = "UMAP Bray-Curtis unadjusted", 
+         x = "UMAP1", 
+         y = "UMAP2", 
+         color = "Batch") +
+    theme_minimal()+ 
+    theme(
+        axis.text = element_blank()
+    ) +
+    stat_ellipse(show.legend = F) +
+    geom_point(data = centroids, size = 5, shape = 21, color = "black",
+               aes(fill = batch), show.legend = F)
+
+plot_umap_noajustado
+```
+
+```{r}
+adonis_result <- adonis2(t(pretse_LP$abundance_table) ~ pretse_LP$samples_metadata$Batch)
+print(adonis_result)
+estadisitica_ajuste_batch_df["Sin ajustar", "Batch Varianza"] <- paste(round(adonis_result$R2[1]* 100, 2), "%")
+estadisitica_ajuste_batch_df["Sin ajustar", "p.value Batch"] <- adonis_result$`Pr(>F)`[1]
+
+cat("\n------------------\n")
+adonis_result <- adonis2(t(pretse_LP$abundance_table) ~ pretse_LP$samples_metadata$Survival)
+print(adonis_result)
+estadisitica_ajuste_batch_df["Sin ajustar", "Survival Varianza"] <- paste(round(adonis_result$R2[1]* 100, 2), "%")
+estadisitica_ajuste_batch_df["Sin ajustar", "p.value Survival"] <- adonis_result$`Pr(>F)`[1]
+
+estadisitica_ajuste_batch_df
+```
+
+## Loadings
+
+```{r}
+# coldata rownames match assay colnames
+all(rownames(pretse_LP$samples_metadata) == colnames(pretse_LP$abundance_table)) # our dataset
+##  [1] TRUE
+class(pretse_LP$samples_metadata) # should be data.frame or DataFrame
+##  [1] "data.frame"
+
+# rowdata rownames match assay rownames
+all(rownames(pretse_LP$tax) == rownames(pretse_LP$abundance_table)) # our dataset
+##  [1] TRUE
+class(pretse_LP$tax) # should be data.frame or DataFrame
+##  [1] "data.frame"
+
+# Counts
+pretse_LP$abundance_table <- as.matrix(pretse_LP$abundance_table)
+class(pretse_LP$abundance_table) # should be a numeric matrix
+##  [1] "matrix" "array"
+
+# Create a TreeSE
+tse <- TreeSummarizedExperiment(
+    assays =  SimpleList(counts = pretse_LP$abundance_table),
+    colData = DataFrame(pretse_LP$samples_metadata),
+    rowData = DataFrame(pretse_LP$tax))
+
+tse <- transformAssay(tse, assay.type = "counts", method = "relabundance")
+```
+
+```{r}
+variables <- colnames(colData(tse))[!(colnames(colData(tse)) %in% c("nombre_muestra", "tipo_muestra"))]
+form <- as.formula(paste("assay", "~", paste(variables, collapse = "+")))
+
+tse2 <- addRDA(
+    tse,
+    assay.type = "relabundance",
+    formula = form,
+    distance = "bray")
+
+# Store results of PERMANOVA test
+rda_info <- attr(reducedDim(tse2, "RDA"), "significance")
+
+rda_info_sinajustar <- rda_info
+```
+
+# ConQuR
+
+### Preparar datos
+
+```{r}
+# taxa tiene que tener la taxonomia en las columnas y los samples en las filas
+taxa_LP <- data.frame(t(pretse_LP$abundance_table))
+
+# Para sacar la lista de los batch primero hay que ordenar los samples en el samples_metadata
+
+## Asegurarse de que ambos dataframes tengan los mismos rownames
+common_rows <- intersect(rownames(taxa_LP), rownames(pretse_LP$samples_metadata))
+
+taxa_LP <- taxa_LP[common_rows, ]
+samples_metadata_LP <- pretse_LP$samples_metadata[match(rownames(taxa_LP), rownames(pretse_LP$samples_metadata)), ]
+
+covar_LP <- samples_metadata_LP 
+
+taxa_LP <- taxa_LP[rownames(taxa_LP) %in% rownames(covar_LP), ]
+
+batchid_LP <- as.factor(covar_LP$Batch)
+
+covar_LP <- covar_LP %>%
+    dplyr::select(-c("nombre_muestra", "Batch", "tipo_muestra"))
+
+covar_salida <- covar_LP %>% 
+    dplyr::select(Survival, AR, Biliary_complications) 
+```
+
+### Fine tunning automático
+
+```{r, eval=FALSE}
+result_tuned <- Tune_ConQuR(tax_tab=taxa_LP,
+                           batchid=batchid_LP,
+                           covariates=covar_salida,
+                           batch_ref_pool=c("RUN 3"),
+                           logistic_lasso_pool=c(T, F),
+                           quantile_type_pool=c("standard", "lasso"),
+                           simple_match_pool=c(T, F),
+                           lambda_quantile_pool=c(NA, "2p/n", "2p/logn"),
+                           interplt_pool=c(T, F),
+                           frequencyL=0,
+                           frequencyU=1,
+                           num_core = num_cores-2)
+
+saveRDS(result_tuned, "../../RDSs/paper/result_tuned_Survival_AR_BC.RDS")
+```
+
+Pruebas realizadas en el archivo "Buscar mejor bajada efecto Batch.Rmd"
+
+```{r}
+taxa_corrected_salida <- readRDS("../../RDSs/paper/result_tuned.RDS")
+par(mfrow=c(1, 2))
+
+Plot_PCoA(TAX=taxa_LP, factor=batchid_LP, main="Before Correction, Bray-Curtis")
+Plot_PCoA(TAX=taxa_corrected_salida$tax_final, factor=batchid_LP, main="ConQuR (Default), Bray-Curtis")
+
+```
+
+## Bray
+
+```{r}
+taxa_corrected_salida$tax_final <- taxa_corrected_salida$tax_final
+
+# Calcular la matriz de distancia usando Bray-Curtis
+distance_matrix <- vegdist(taxa_corrected_salida$tax_final, method = "bray")
+
+# Realizar el PCoA
+pcoa_result <- cmdscale(distance_matrix, k = 2, eig = TRUE)
+
+# Crear un data.frame con los resultados y añadir la información del batch
+pcoa_data <- as.data.frame(pcoa_result$points)
+colnames(pcoa_data) <- c("PCoA1", "PCoA2")
+pcoa_data$batch <- pretse_LP$samples_metadata$Batch
+
+centroids <- pcoa_data %>%
+  dplyr::group_by(batch) %>%
+  dplyr::summarize(PCoA1 = mean(PCoA1, na.rm = TRUE),
+            PCoA2 = mean(PCoA2, na.rm = TRUE))
+ 
+plot_b <- ggplot(pcoa_data, aes(x = PCoA1, y = PCoA2, color = batch)) +
+  geom_point(size = 2) +
+    scale_color_manual(values = paletteer_d("ggthemes::wsj_rgby")) +
+    scale_fill_manual(values = paletteer_d("ggthemes::wsj_rgby")) + 
+    labs(title = "PCoA Bray-Curtis", 
+         x = paste("PCoA1",round(pcoa_result$eig[1], 2), "%"), 
+         y = paste("PCoA2",round(pcoa_result$eig[2], 2), "%"), 
+         color = "Batch") +
+    theme_minimal()+ 
+    theme(
+        axis.text = element_blank()
+    ) +
+    stat_ellipse(show.legend = F) +
+    geom_point(data = centroids, size = 5, shape = 21, color = "black",
+               aes(fill = batch), show.legend = F)
+plot_b
+```
+
+## UMAP
+
+```{r}
+abundancia_norm <- decostand(taxa_corrected_salida$tax_final, method = "hellinger")
+
+set.seed(123)  # Para resultados reproducibles
+
+# Usando el paquete umap
+umap_result <- umap(abundancia_norm)
+
+# Usando uwot (opción más rápida y flexible)
+umap_result <- umap(abundancia_norm, n_neighbors = 15, min_dist = 0.1, metric = "euclidean")
+
+# Convertir resultado a dataframe
+umap_df <- data.frame(
+  UMAP1 = umap_result$layout[,1],
+  UMAP2 = umap_result$layout[,2],
+  Muestra = rownames(t(pretse_LP$abundance_table)),
+  batch = pretse_LP$samples_metadata$Batch
+)
+
+centroids <- umap_df %>%
+  dplyr::group_by(batch) %>%
+  dplyr::summarize(UMAP1 = mean(UMAP1, na.rm = TRUE),
+            UMAP2 = mean(UMAP2, na.rm = TRUE))
+
+# Graficar
+plot_umap_conqur <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = batch)) +
+   geom_point(size = 2) +
+    scale_color_manual(values = paletteer_d("ggthemes::wsj_rgby")) +
+    scale_fill_manual(values = paletteer_d("ggthemes::wsj_rgby")) + 
+    labs(title = "UMAP Bray-Curtis ConQuR", 
+         x = "UMAP1", 
+         y = "UMAP2", 
+         color = "Batch") +
+    theme_minimal()+ 
+    theme(
+        axis.text = element_blank()
+    ) +
+    stat_ellipse(show.legend = F) +
+    geom_point(data = centroids, size = 5, shape = 21, color = "black",
+               aes(fill = batch), show.legend = F)
+
+plot_umap_conqur
+```
+
+
+```{r,warning=FALSE}
+adonis_result <- adonis2(taxa_corrected_salida$tax_final ~ pretse_LP$samples_metadata$Batch)
+print(adonis_result)
+estadisitica_ajuste_batch_df["ConQuR", "Batch Varianza"] <- paste(round(adonis_result$R2[1]* 100, 2), "%")
+estadisitica_ajuste_batch_df["ConQuR", "p.value Batch"] <- adonis_result$`Pr(>F)`[1]
+
+cat("\n------------------\n")
+adonis_result <- adonis2(taxa_corrected_salida$tax_final ~ pretse_LP$samples_metadata$Survival)
+print(adonis_result)
+estadisitica_ajuste_batch_df["ConQuR", "Survival Varianza"] <- paste(round(adonis_result$R2[1]* 100, 2), "%")
+estadisitica_ajuste_batch_df["ConQuR", "p.value Survival"] <- adonis_result$`Pr(>F)`[1]
+
+estadisitica_ajuste_batch_df
+```
+
+## Loadings
+
+```{r}
+# coldata rownames match assay colnames
+all(rownames(pretse_LP$samples_metadata) == colnames(t(taxa_corrected_salida$tax_final))) # our dataset
+##  [1] TRUE
+class(pretse_LP$samples_metadata) # should be data.frame or DataFrame
+##  [1] "data.frame"
+
+# Obtén las filas comunes
+common_rows <- intersect(rownames(pretse_LP$tax), rownames(t(taxa_corrected_salida$tax_final)))
+# Filtra ambos dataframes para que solo contengan las filas comunes
+taxa <- pretse_LP$tax[common_rows, ]
+taxa_corrected_salida$tax_final <- t(taxa_corrected_salida$tax_final)[common_rows, , drop = FALSE]
+taxa_corrected_salida$tax_final <- t(taxa_corrected_salida$tax_final)
+# rowdata rownames match assay rownames
+all(rownames(taxa) == rownames(t(taxa_corrected_salida$tax_final))) # our dataset
+##  [1] TRUE
+class(pretse_LP$tax) # should be data.frame or DataFrame
+##  [1] "data.frame"
+
+# Counts
+class(t(taxa_corrected_salida$tax_final)) # should be a numeric matrix
+##  [1] "matrix" "array"
+
+# Create a TreeSE
+tse <- TreeSummarizedExperiment(
+    assays =  SimpleList(counts = t(taxa_corrected_salida$tax_final)),
+    colData = DataFrame(pretse_LP$samples_metadata),
+    rowData = DataFrame(taxa))
+
+tse <- transformAssay(tse, assay.type = "counts", method = "relabundance")
+```
+
+```{r}
+variables <- colnames(colData(tse))[!(colnames(colData(tse)) %in% c("nombre_muestra", "tipo_muestra"))]
+form <- as.formula(paste("assay", "~", paste(variables, collapse = "+")))
+
+tse2 <- addRDA(
+    tse,
+    assay.type = "relabundance",
+    formula = form,
+    distance = "bray")
+
+# Store results of PERMANOVA test
+rda_info <- attr(reducedDim(tse2, "RDA"), "significance")
+
+rda_info_conqur <- rda_info
+```
+
+# SVA
+## Preparar datos
+
+```{r}
+library(sva)
+matrix_data <- pretse_LP$abundance_table
+
+covs <- pretse_LP$samples_metadata
+covs$Batch <- factor(covs$Batch, levels = c("RUN 3", setdiff(unique(covs$Batch), "RUN 3")))
+```
+
+```{r}
+mm <- model.matrix(~ Batch, data = covs)
+nullmm <- model.matrix(~ 1, data = covs)
+
+cat("Launching svaseq\n")
+print(Sys.time())
+
+dat <- as.matrix(matrix_data)
+
+for (i in 1:nrow(matrix_data)) {
+
+  for(j in 1:ncol(matrix_data)){
+
+     if (matrix_data[i,j]<=0) matrix_data[i,j]<-0
+
+     j=j+1
+  }
+  i=i+1
+}
+
+# Filtrar filas con varianza mayor a cero
+matrix_data_filtered <- matrix_data[apply(matrix_data, 1, var) > 0, ]
+
+svas  <- sva::svaseq(dat=as.matrix(matrix_data_filtered), mod=mm, mod0=nullmm)
+colnames(svas$sv) <- paste0("SV", seq(1:ncol(svas$sv)))
+print(Sys.time())
+
+numeric.covs <- covs[,c("Survival", "Biliary_complications", "AR", "AHT")]
+linp <- matrix(ncol=svas$n.sv,nrow=ncol(numeric.covs))
+rownames(linp) <- colnames(numeric.covs)
+colnames(linp) <- paste0("SV",1:svas$n.sv)
+linp[] <- 0
+
+for(cov in 1:ncol(numeric.covs)){
+
+  for(sva in 1:svas$n.sv){
+
+    if(svas$n.sv == 1)
+      axis <- svas$sv
+
+    else
+      axis <- svas$sv[,sva]
+
+    linp[cov,sva] <- cor.test(as.numeric(numeric.covs[,cov]),axis)$p.value
+  }
+}
+
+smallest = -10
+linp10 <- log10(linp)
+linp10 <- replace(linp10, linp10 <= smallest, smallest)
+tonote <- signif(linp, 1)
+
+# We remove the SVs that are significantly associated with some covariate of interest.
+linpDF <- as.data.frame(linp)
+svsToRemove <- sort(unique(as.vector(unlist(apply(linp,1, function(x) which(x<0.05))))))
+svas$sv <- svas$sv[, -svsToRemove]
+
+covs.rs <- as.data.frame(covs[,"Batch"])
+cat("Creating residuals taking into account", paste0(colnames(svas$sv), collapse=", "), "\n")
+resids <- apply(matrix_data, 1, function(y){
+  lm( y ~ . , data=cbind(covs.rs,svas$sv))$residuals
+})
+rownames(resids) <- colnames(matrix_data)
+```
+
+## Bray
+
+```{r}
+# Calcular la matriz de distancia usando Bray-Curtis
+distance_matrix <- vegdist(resids^2, method = "bray")
+
+# Realizar el PCoA
+pcoa_result <- cmdscale(distance_matrix, k = 2, eig = TRUE)
+
+# Crear un data.frame con los resultados y añadir la información del batch
+pcoa_data <- as.data.frame(pcoa_result$points)
+colnames(pcoa_data) <- c("PCoA1", "PCoA2")
+pcoa_data$batch <- pretse_LP$samples_metadata$Batch
+
+centroids <- pcoa_data %>%
+  dplyr::group_by(batch) %>%
+  dplyr::summarize(PCoA1 = mean(PCoA1, na.rm = TRUE),
+            PCoA2 = mean(PCoA2, na.rm = TRUE))
+
+plot_sva <- ggplot(pcoa_data, aes(x = PCoA1, y = PCoA2, color = batch)) +
+  geom_point(size = 2) +
+    scale_color_manual(values = paletteer_d("ggthemes::wsj_rgby")) +
+    scale_fill_manual(values = paletteer_d("ggthemes::wsj_rgby")) + 
+    labs(title = "PCoA Bray-Curtis", 
+         x = paste("PCoA1",round(pcoa_result$eig[1], 2), "%"), 
+         y = paste("PCoA2",round(pcoa_result$eig[2], 2), "%"), 
+         color = "Batch") +
+    theme_minimal()+ 
+    theme(
+        axis.text = element_blank()
+    ) +
+    stat_ellipse(show.legend = F) +
+    geom_point(data = centroids, size = 5, shape = 21, color = "black",
+               aes(fill = batch), show.legend = F)
+plot_sva
+```
+
+```{r,warning=FALSE}
+adonis_result <- adonis2(resids^2 ~ pretse_LP$samples_metadata$Batch)
+print(adonis_result)
+estadisitica_ajuste_batch_df["SVA", "Batch Varianza"] <- paste(round(adonis_result$R2[1]* 100, 2), "%")
+estadisitica_ajuste_batch_df["SVA", "p.value Batch"] <- adonis_result$`Pr(>F)`[1]
+
+cat("\n------------------\n")
+adonis_result <- adonis2(resids^2 ~ pretse_LP$samples_metadata$Survival)
+print(adonis_result)
+estadisitica_ajuste_batch_df["SVA", "Survival Varianza"] <- paste(round(adonis_result$R2[1]* 100, 2), "%")
+estadisitica_ajuste_batch_df["SVA", "p.value Survival"] <- adonis_result$`Pr(>F)`[1]
+
+estadisitica_ajuste_batch_df
+```
+
+# ComBat
+## Preparar datos
+
+```{r}
+pheno = pretse_LP$samples_metadata
+edata = pretse_LP$abundance_table
+batch = pheno$Batch
+mod = model.matrix(~ MEAF_score + Survival + AR + AHT + Biliary_complications, data=pheno)
+
+# parametric adjustment
+combat_edata1 = ComBat(dat=edata, batch=batch, mod=NULL, par.prior=TRUE, prior.plots=FALSE)
+
+# non-parametric adjustment, mean-only version
+combat_edata2 = ComBat(dat=edata, batch=batch, mod=NULL, par.prior=FALSE, mean.only=TRUE)
+
+# reference-batch version, with covariates
+combat_edata3 = ComBat(dat=edata, batch=batch, mod=mod, par.prior=T, ref.batch="RUN 3")
+```
+
+## Bray
+
+```{r}
+# Calcular la matriz de distancia usando Bray-Curtis
+distance_matrix <- vegdist(t(combat_edata3), method = "bray")
+
+# Realizar el PCoA
+pcoa_result <- cmdscale(distance_matrix, k = 2, eig = TRUE)
+
+# Crear un data.frame con los resultados y añadir la información del batch
+pcoa_data <- as.data.frame(pcoa_result$points)
+colnames(pcoa_data) <- c("PCoA1", "PCoA2")
+pcoa_data$batch <- pretse_LP$samples_metadata$Batch
+
+centroids <- pcoa_data %>%
+  dplyr::group_by(batch) %>%
+  dplyr::summarize(PCoA1 = mean(PCoA1, na.rm = TRUE),
+            PCoA2 = mean(PCoA2, na.rm = TRUE))
+ 
+plot_ComBat <- ggplot(pcoa_data, aes(x = PCoA1, y = PCoA2, color = batch)) +
+  geom_point(size = 2) +
+    scale_color_manual(values = paletteer_d("ggthemes::wsj_rgby")) +
+    scale_fill_manual(values = paletteer_d("ggthemes::wsj_rgby")) + 
+    labs(title = "PCoA Bray-Curtis", 
+         x = paste("PCoA1",round(pcoa_result$eig[1], 2), "%"), 
+         y = paste("PCoA2",round(pcoa_result$eig[2], 2), "%"), 
+         color = "Batch") +
+    theme_minimal()+ 
+    theme(
+        axis.text = element_blank()
+    ) +
+    stat_ellipse(show.legend = F) +
+    geom_point(data = centroids, size = 5, shape = 21, color = "black",
+               aes(fill = batch), show.legend = F)
+plot_ComBat
+```
+
+
+```{r,warning=FALSE}
+adonis_result <- adonis2(t(combat_edata3) ~ pretse_LP$samples_metadata$Batch)
+print(adonis_result)
+estadisitica_ajuste_batch_df["Combat", "Batch Varianza"] <- paste(round(adonis_result$R2[1]* 100, 2), "%")
+estadisitica_ajuste_batch_df["Combat", "p.value Batch"] <- adonis_result$`Pr(>F)`[1]
+
+cat("\n------------------\n")
+adonis_result <- adonis2(t(combat_edata3) ~ pretse_LP$samples_metadata$Survival)
+print(adonis_result)
+estadisitica_ajuste_batch_df["Combat", "Survival Varianza"] <- paste(round(adonis_result$R2[1]* 100, 2), "%")
+estadisitica_ajuste_batch_df["Combat", "p.value Survival"] <- adonis_result$`Pr(>F)`[1]
+
+estadisitica_ajuste_batch_df
+```
+
+# MMUPHin
+## Preparar datos
+
+```{r}
+
+library(MMUPHin)
+
+##########################
+# Create sample metadata #
+##########################
+data_meta <- pretse_LP$samples_metadata
+data_meta$Batch <- factor(data_meta$Batch, levels = c("RUN 3", setdiff(unique(data_meta$Batch), "RUN 3")))
+
+
+###########################
+# Create Species Features #
+###########################
+# Transpose the abundance matrix and change the value of abundance data to
+# proportion unit
+data_abd <- pretse_LP$abundance_table
+
+# Match the individuals in the data_abd
+data_abd <- data_abd[, colnames(data_abd) %in% rownames(data_meta)]
+
+# Use adjust_batch to correct for differences in the five studies, while
+# controlling for the effect of cases versus control (variable resvar in
+# data_meta).
+fit_adjust_batch <- adjust_batch(
+    feature_abd = data_abd,
+    batch = "Batch",
+    covariates = NULL,
+    data = data_meta,
+    control = list(verbose = FALSE, diagnostic_plot = NULL))
+
+data_abd_adj <- fit_adjust_batch$feature_abd_adj
+
+
+```
+
+## Bray
+
+```{r}
+# Calcular la matriz de distancia usando Bray-Curtis
+distance_matrix <- vegdist(t(data_abd_adj), method = "bray")
+
+# Realizar el PCoA
+pcoa_result <- cmdscale(distance_matrix, k = 2, eig = TRUE)
+
+# Crear un data.frame con los resultados y añadir la información del batch
+pcoa_data <- as.data.frame(pcoa_result$points)
+colnames(pcoa_data) <- c("PCoA1", "PCoA2")
+pcoa_data$batch <- pretse_LP$samples_metadata$Batch
+
+centroids <- pcoa_data %>%
+  dplyr::group_by(batch) %>%
+  dplyr::summarize(PCoA1 = mean(PCoA1, na.rm = TRUE),
+            PCoA2 = mean(PCoA2, na.rm = TRUE))
+
+
+ 
+plot_MMUPHin <- ggplot(pcoa_data, aes(x = PCoA1, y = PCoA2, color = batch)) +
+  geom_point(size = 2) +
+    scale_color_manual(values = paletteer_d("ggthemes::wsj_rgby")) +
+    scale_fill_manual(values = paletteer_d("ggthemes::wsj_rgby")) + 
+    labs(title = "PCoA Bray-Curtis", 
+         x = paste("PCoA1",round(pcoa_result$eig[1], 2), "%"), 
+         y = paste("PCoA2",round(pcoa_result$eig[2], 2), "%"), 
+         color = "Batch") +
+    theme_minimal()+ 
+    theme(
+        axis.text = element_blank()
+    ) +
+    stat_ellipse(show.legend = F) +
+    geom_point(data = centroids, size = 5, shape = 21, color = "black",
+               aes(fill = batch), show.legend = F)
+plot_MMUPHin
+```
+
+```{r,warning=FALSE}
+adonis_result <- adonis2(t(data_abd_adj) ~ pretse_LP$samples_metadata$Batch)
+print(adonis_result)
+estadisitica_ajuste_batch_df["MMUPHin", "Batch Varianza"] <- paste(round(adonis_result$R2[1]* 100, 2), "%")
+estadisitica_ajuste_batch_df["MMUPHin", "p.value Batch"] <- adonis_result$`Pr(>F)`[1]
+
+cat("\n------------------\n")
+adonis_result <- adonis2(t(data_abd_adj) ~ pretse_LP$samples_metadata$Survival)
+print(adonis_result)
+estadisitica_ajuste_batch_df["MMUPHin", "Survival Varianza"] <- paste(round(adonis_result$R2[1]* 100, 2), "%")
+estadisitica_ajuste_batch_df["MMUPHin", "p.value Survival"] <- adonis_result$`Pr(>F)`[1]
+
+estadisitica_ajuste_batch_df
+```
+
+# Permanova variables salida
+
+## Bray
+
+```{r}
+taxa_corrected_salida$tax_final <- taxa_corrected_salida$tax_final
+
+# Calcular la matriz de distancia usando Bray-Curtis
+distance_matrix <- vegdist(taxa_corrected_salida$tax_final, method = "bray")
+
+# Realizar el PCoA
+pcoa_result <- cmdscale(distance_matrix, k = 2, eig = TRUE)
+
+pcoa_data <- as.data.frame(pcoa_result$points)
+colnames(pcoa_data) <- c("PCoA1", "PCoA2")
+
+plots <- list()
+
+for (i in names(pretse_LP$samples_metadata)) {
+    evitar <- c("nombre_muestra", "tipo_muestra", "Age_Donor","BMI_D", "GOT_D", "GPT_D", "PT_ACT_D", "Cold_Isch", "MEAF_score","")
+    
+    if (i %in% evitar){next}
+    
+    pcoa_data[i] <- pretse_LP$samples_metadata[[i]]
+
+    centroids <- pcoa_data %>%
+      dplyr::group_by(!!sym(i)) %>%
+      dplyr::summarize(PCoA1 = mean(PCoA1, na.rm = TRUE),
+                PCoA2 = mean(PCoA2, na.rm = TRUE))
+     
+    plots[[i]] <- ggplot(pcoa_data, aes_string(x = "PCoA1", y = "PCoA2", color = i)) +
+      geom_point(size = 2) +
+        scale_color_manual(values = paletteer_d("ggthemes::wsj_rgby")) +
+        scale_fill_manual(values = paletteer_d("ggthemes::wsj_rgby")) +
+        labs(title = "PCoA Bray-Curtis", 
+             x = paste("PCoA1",round(pcoa_result$eig[1], 2), "%"), 
+             y = paste("PCoA2",round(pcoa_result$eig[2], 2), "%"), 
+             color = i) +
+        theme_minimal()+ 
+        theme(
+            axis.text = element_blank()
+        ) +
+        stat_ellipse(show.legend = F) +
+        geom_point(data = centroids, size = 5, shape = 21, color = "black",
+                   aes_string(fill = i), show.legend = F) 
+    
+    
+    
+}
+
+plots
+
+```
+
+## UMAP
+
+```{r}
+abundancia_norm <- decostand(taxa_corrected_salida$tax_final, method = "hellinger")
+
+set.seed(123)  # Para resultados reproducibles
+
+# Usando el paquete umap
+umap_result <- umap(abundancia_norm)
+
+# Usando uwot (opción más rápida y flexible)
+umap_result <- umap(abundancia_norm, n_neighbors = 15, min_dist = 0.1, metric = "euclidean")
+
+plots <- list()
+
+for (i in names(pretse_LP$samples_metadata)) {
+    evitar <- c("nombre_muestra", "tipo_muestra", "Age_Donor","BMI_D", "GOT_D", "GPT_D", "PT_ACT_D", "Cold_Isch", "MEAF_score","")
+    
+    if (i %in% evitar){next}
+
+    umap_df <- data.frame(
+      UMAP1 = umap_result$layout[,1],
+      UMAP2 = umap_result$layout[,2],
+      Muestra = rownames(t(pretse_LP$abundance_table)),
+      variable = pretse_LP$samples_metadata[[i]]
+    )
+    colnames(umap_df)[4] <- i  # Renombrar la columna correctamente
+    
+    rownames(umap_df) <- umap_df$Muestra
+    umap_df$Muestra <- NULL
+
+    centroids <- umap_df %>%
+      dplyr::group_by(!!sym(i)) %>%
+      dplyr::summarize(UMAP1 = mean(UMAP1, na.rm = TRUE),
+                UMAP2 = mean(UMAP2, na.rm = TRUE))
+     
+    plots[[i]] <- ggplot(umap_df, aes_string(x = "UMAP1", y = "UMAP2", color = i)) +
+      geom_point(size = 2) +
+        scale_color_manual(values = paletteer_d("ggthemes::wsj_rgby")) +
+        scale_fill_manual(values = paletteer_d("ggthemes::wsj_rgby")) +
+        labs(title = "UMAP Bray-Curtis", 
+             x = "UMAP1",
+             y = "UMAP2",
+             color = i) +
+        theme_minimal()+ 
+        theme(
+            axis.text = element_blank()
+        ) +
+        stat_ellipse(show.legend = F) +
+        geom_point(data = centroids, size = 5, shape = 21, color = "black",
+                   aes_string(fill = i), show.legend = F)
+    
+    
+}
+
+plots
+```
+
+# Articulo
+
+```{r, fig.width=10, fig.height=5}
+plot_bb <- plot_b + 
+    theme(
+        legend.position = "none",
+        plot.title = element_text(size = 12, face = "bold")
+    ) +
+    labs(
+        x = "PCoA 1",
+        y = "PCoA 2"
+    ) +
+    annotate(
+        "text", 
+        x = 0, 
+        y = 0.4, 
+        label = paste0("Explained variance PERMANOVA: ", estadisitica_ajuste_batch_df[2,1], 
+                       "\n pvalue: ", estadisitica_ajuste_batch_df[2,2]), 
+        size = 4,    # Tamaño del texto
+        hjust = 0.5, # Ajusta el texto horizontalmente
+        vjust = 0.5, # Ajusta el texto verticalmente
+        fontface = "plain" # Configura el texto como no negrita
+    )
+            
+
+plot_aa <- plot_a + 
+    theme(
+          plot.title = element_text(size = 12, face = "bold")
+    ) +
+    labs(
+        x = "PCoA 1",
+        y = "PCoA 2",
+        title = "PCoA Bray-Curtis unadjusted"
+    ) +
+    annotate(
+        "text", 
+        x = 0, 
+        y = 0.5, 
+        label = paste0("Explained variance PERMANOVA: ", estadisitica_ajuste_batch_df[1,1], 
+                       "\n pvalue: ", estadisitica_ajuste_batch_df[1,2]), 
+        size = 4,    # Tamaño del texto
+        hjust = 0.5, # Ajusta el texto horizontalmente
+        vjust = 0.5, # Ajusta el texto verticalmente
+        fontface = "plain" # Configura el texto como no negrita
+    )
+
+cowplot::plot_grid(plot_aa, plot_bb, ncol=2, 
+                   # labels=LETTERS[1:2], 
+                   # label_size = 10, 
+                   rel_widths=c(1.25, 1))
+
+
+```
+
+```{r, fig.height=3, fig.width=10}
+rda_info_conqur1 <- rda_info_conqur$permanova |> 
+    rownames_to_column("Vars") |> 
+    mutate(Vars = recode(Vars, 
+                         Donation = "Type of donation",
+                         Sex_Donor = "Donor sex",
+                         Age_Donor = "Donor age",
+                         "BMI_D" = "Donor BMI",
+                         "GOT_D" = "Donor AST",
+                         "GPT_D" = "Donor ALT",
+                         "PT_ACT_D" = "Donor prothrombin activity",
+                         Cold_Isch = "Time cold ischaemia",
+                         MEAF_score = "MEAF score",
+                         AHT = "HAT", 
+                         Biliary_complications = "Biliary complications")) |>
+    mutate(ajuste = "ConQuR") |> 
+    rename_with(~"pvalue", matches("Pr\\(>F\\)")) |> 
+    dplyr::select(Vars, pvalue, ajuste) 
+
+rda_info_sinajustar1 <- rda_info_sinajustar$permanova |> 
+    rownames_to_column("Vars") |> 
+     mutate(Vars = recode(Vars, 
+                         Donation = "Type of donation",
+                         Sex_Donor = "Donor sex",
+                         Age_Donor = "Donor age",
+                         "BMI_D" = "Donor BMI",
+                         "GOT_D" = "Donor AST",
+                         "GPT_D" = "Donor ALT",
+                         "PT_ACT_D" = "Donor prothrombin activity",
+                         Cold_Isch = "Time cold ischaemia",
+                         MEAF_score = "MEAF score",
+                         AHT = "HAT", 
+                         Biliary_complications = "Biliary complications")) |>
+    mutate(ajuste = "Unadjusted") |> 
+    rename_with(~"pvalue", matches("Pr\\(>F\\)")) |> 
+    dplyr::select(Vars, pvalue, ajuste) 
+
+rbind(rda_info_conqur1, rda_info_sinajustar1) |> 
+    dplyr::filter(Vars != "Model", Vars != "Residual") |> 
+    dplyr::filter(!Vars %in% c("Survival", "AR", "HAT", "Biliary complications")) |>
+    mutate(ajuste = fct_relevel(ajuste, "Unadjusted")) |>
+    ggplot(aes(x = Vars, y=-log10(pvalue), fill=-log10(pvalue))) +
+    geom_col(color = "black", size = 0.5) +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey") +
+    theme_minimal() +
+    facet_wrap(~ajuste, scales = "free_x") +
+    scale_fill_gradientn(colors = paletteer::paletteer_c("ggthemes::Red-Blue Diverging", 30)) +
+    theme( 
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        strip.text = element_text(size = 12, face = "bold"), 
+        legend.position = "none",
+        panel.spacing = unit(1, "cm"),  # Aumenta el espacio entre facetas
+        axis.title.y = element_text(size = 8)
+    ) + 
+    labs(
+        x = "",
+        y = "-log10(pvalue) PERMANOVA"
+    ) +
+    annotate("text", x = Inf, y = -log10(0.05) + 0.05, label = "pvalue = 0.05", 
+             hjust = 1, vjust = -0.5, size = 3.5)
+```
+
+```{r, fig.width=10, fig.height=8}
+plot_pcoa_conqur <- plot_b + 
+    theme(
+        legend.position = "none",
+        plot.title = element_text(size = 12, face = "bold"),
+        plot.margin = margin(20,20,20,20)
+    ) +
+    labs(
+        x = "PCoA 1",
+        y = "PCoA 2",
+        title = "PCoA Bray-Curtis by ConQuR"
+    ) +
+    annotate(
+        "text", 
+        x = 0, 
+        y = 0.4, 
+        label = paste0("Explained variance PERMANOVA: ", estadisitica_ajuste_batch_df[2,1], 
+                       "\n pvalue: ", estadisitica_ajuste_batch_df[2,2]), 
+        size = 3,    # Tamaño del texto
+        hjust = 0.5, # Ajusta el texto horizontalmente
+        vjust = 0.5, # Ajusta el texto verticalmente
+        fontface = "plain" # Configura el texto como no negrita
+    )
+            
+
+plot_pcoa_sinajustar <- plot_a + 
+    theme(
+        plot.title = element_text(size = 12, face = "bold"),
+        plot.margin = margin(20,20,20,20),
+        legend.text = element_text(size = 10, vjust = 0.5),
+        legend.title =  element_text(size = 12, face = "bold")
+    ) +
+    guides(color = guide_legend(override.aes = list(size = 5))) +
+    labs(
+        x = "PCoA 1",
+        y = "PCoA 2",
+        title = "PCoA Bray-Curtis unadjusted"
+    ) +
+    annotate(
+        "text", 
+        x = 0, 
+        y = 0.8, 
+        label = paste0("Explained variance PERMANOVA: ", estadisitica_ajuste_batch_df[1,1], 
+                       "\n pvalue: ", estadisitica_ajuste_batch_df[1,2]), 
+        size = 3,    # Tamaño del texto
+        hjust = 0.5, # Ajusta el texto horizontalmente
+        vjust = 0.5, # Ajusta el texto verticalmente
+        fontface = "plain" # Configura el texto como no negrita
+    )
+
+plot_sva1 <- plot_sva +
+    theme(
+        legend.position = "none",
+        plot.title = element_text(size = 12, face = "bold"),
+        plot.margin = margin(20,20,20,20)
+    ) +
+    labs(
+        x = "PCoA 1",
+        y = "PCoA 2",
+        title = "PCoA Bray-Curtis by SVA"
+    ) +
+     annotate(
+        "text", 
+        x = 0, 
+        y = 0.8, 
+        label = paste0("Explained variance PERMANOVA: ", estadisitica_ajuste_batch_df[3,1], 
+                       "\n pvalue: ", estadisitica_ajuste_batch_df[3,2]), 
+        size = 3,    # Tamaño del texto
+        hjust = 0.5, # Ajusta el texto horizontalmente
+        vjust = 0.5, # Ajusta el texto verticalmente
+        fontface = "plain" # Configura el texto como no negrita
+    ) 
+
+plot_ComBat1 <- plot_ComBat+
+    theme(
+        legend.position = "none",
+        plot.title = element_text(size = 12, face = "bold"),
+        plot.margin = margin(20,20,20,20)
+    ) +
+    labs(
+        x = "PCoA 1",
+        y = "PCoA 2",
+        title = "PCoA Bray-Curtis by ComBat"
+    ) +
+     annotate(
+        "text", 
+        x = 0, 
+        y = 0.5, 
+        label = paste0("Explained variance PERMANOVA: ", estadisitica_ajuste_batch_df[4,1], 
+                       "\n pvalue: ", estadisitica_ajuste_batch_df[4,2]), 
+        size = 3,    # Tamaño del texto
+        hjust = 0.5, # Ajusta el texto horizontalmente
+        vjust = 0.5, # Ajusta el texto verticalmente
+        fontface = "plain" # Configura el texto como no negrita
+    ) 
+
+plot_MMUPHin1 <- plot_MMUPHin +
+    theme(
+        legend.position = "none",
+        plot.title = element_text(size = 12, face = "bold"),
+        plot.margin = margin(20,20,20,20)
+    ) +
+    labs(
+        x = "PCoA 1",
+        y = "PCoA 2",
+        title = "PCoA Bray-Curtis by MMUPHin1"
+    ) +
+     annotate(
+        "text", 
+        x = 0, 
+        y = 0.8, 
+        label = paste0("Explained variance PERMANOVA: ", estadisitica_ajuste_batch_df[5,1], 
+                       "\n pvalue: ", estadisitica_ajuste_batch_df[5,2]), 
+        size = 3,    # Tamaño del texto
+        hjust = 0.5, # Ajusta el texto horizontalmente
+        vjust = 0.5, # Ajusta el texto verticalmente
+        fontface = "plain" # Configura el texto como no negrita
+    ) 
+
+plot_umap_noajustado1 <- plot_umap_noajustado +
+    theme(
+        legend.position = "none",
+        plot.title = element_text(size = 12, face = "bold"),
+        plot.margin = margin(20,20,20,20)
+    ) +
+    labs(
+        title = "UMAP Bray-Curtis unadjusted"
+    )
+
+plot_umap_conqur1 <- plot_umap_conqur +
+    theme(
+        legend.position = "none",
+        plot.title = element_text(size = 12, face = "bold"),
+        plot.margin = margin(20,20,20,20)
+    )  +
+    labs(
+        title = "UMAP Bray-Curtis by ConQuR"
+    )
+```
+
+```{r, fig.width=10, fig.height=12}
+
+
+
+cowplot::plot_grid(
+    cowplot::plot_grid(
+        plot_pcoa_sinajustar, plot_umap_noajustado1,
+        ncol=2,
+        rel_widths = c(1.2, 1)
+    ),
+    cowplot::plot_grid(
+        plot_sva1, plot_ComBat1, plot_MMUPHin1, 
+        ncol = 3, 
+        rel_widths = c(1,1,1)
+                   ),
+    cowplot::plot_grid(
+        plot_pcoa_conqur, plot_umap_conqur1, 
+        ncol = 2, 
+        rel_widths = c(1,1,1)
+        ),
+    ncol = 1
+    )
+
+```
+
+
+

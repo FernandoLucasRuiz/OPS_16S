@@ -1,0 +1,3965 @@
+---
+title: "Prediction genus maaslin"
+author: "Fernando Lucas Ruiz (fernando.lucas@um.es)"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    df_print: paged
+    highlight: kate
+    number_sections: true
+    theme: spacelab
+    toc: true
+    toc_float: true
+    code_folding: "hide"
+  pdf_document:
+    toc: true
+subtitle: Cirugía digestiva, endocrina y trasplante de órganos abdominales (IMIB)
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = T, warning = F, message = F)
+```
+
+```{r, warning=FALSE, message=FALSE}
+library(caret)
+library(smotefamily)
+```
+
+```{r, warning=FALSE, message=FALSE}
+source("../Librerias.R")
+source("../utils.R")
+library(doParallel) # para paralelizar procesos
+num_cores <- detectCores()
+registerDoParallel(cores=num_cores - 1)
+
+tse_lp <- readRDS("../../RDSs/paper/tse_lp.RDS")
+```
+
+```{r}
+dda_maaslin_prevalente <- list()
+
+variables_salida <- c("Survival", "AR", "AHT", "Biliary_complications")
+
+for (i in variables_salida) {
+    
+    maslin_objeto <- read_delim(paste0("../../maaslin2/genus/prevalente/paper/", i, "/all_results.tsv")) %>% 
+    dplyr::filter(value != "RUN 1" , value != "RUN 2") 
+    
+    dda_maaslin_prevalente[[i]] <- maslin_objeto
+    
+}
+```
+
+
+## Genus
+
+```{r, warning=FALSE, message=FALSE}
+# Agglomerate by genus and subset by prevalence
+tse_prevalente <- subsetByPrevalent(tse_lp, rank = "Genus", prevalence = 0.1)
+
+# Transform count assay to relative abundances
+tse_prevalente <- transformAssay(tse_prevalente, assay.type = "counts", method = "relabundance")
+```
+
+## AR
+
+```{r}
+df_genus_prevalente <- assay(tse_prevalente, "relabundance")
+
+taxones <- dda_maaslin_prevalente$AR |> 
+    dplyr::filter(pval < 0.05) |>
+    pull(feature)
+
+# Añadir la variables de salida
+df_genus_prevalente <- df_genus_prevalente |> 
+    t()|> 
+    as.data.frame() |>
+    dplyr::select(all_of(taxones))
+
+df_genus_prevalente$AR <- colData(tse_prevalente)$AR
+```
+
+
+
+### Data partition
+
+
+```{r}
+set.seed(1234)
+
+train.Idx.80<- createDataPartition(df_genus_prevalente$AR,
+                                       p=0.7, #Genera un 80% para train, 20% para test
+                                       list = FALSE, # resultados en una matriz
+                                       times = 1) #Genera solamente una partición 80/20
+
+trainSet<- df_genus_prevalente[train.Idx.80, ]
+testSet <- df_genus_prevalente[-train.Idx.80, ]
+
+table(trainSet$AR)
+table(testSet$AR)
+```
+
+### SMOTE
+
+```{r}
+set.seed(1234)
+smote_result <- SMOTE(X = trainSet[, -which(names(trainSet) == "AR")], # Variables predictoras
+                      target = trainSet$AR,                             # Variable de salida
+                      K = 10,                                             # Vecinos más cercanos
+                      dup_size = 2)  
+
+train_data_smote <- smote_result$data
+names(train_data_smote)[ncol(train_data_smote)] <- "AR" # Renombrar la columna de salida
+train_data_smote$AR <- as.factor(train_data_smote$AR) 
+
+table(train_data_smote$AR)
+
+```
+
+### Train control
+
+```{r}
+# Paso 3: Configurar control para el entrenamiento
+ctrl <- trainControl(method = "repeatedcv",
+                     number = 10,
+                     repeats = 10,
+                     seeds = NULL,
+                     allowParallel = T, 
+                     classProbs = T,
+                     )
+```
+
+### Modelos entrenamientos
+
+```{r}
+resamples_train <- data.frame()
+```
+
+#### GLM
+
+```{r, eval=FALSE}
+set.seed(1234)
+model.glm <- train(AR ~ ., data = train_data_smote, 
+               method = "glm", 
+               family = "binomial",                    # Especificar regresión logística
+               metric = "ROC",                         # Optimizar usando el área bajo la curva ROC
+               trControl = ctrl)
+
+saveRDS(model.glm, "../../RDSs/paper/modelos_predictivos/model_AR_glm_10cv10rep_maaslin.RDS")
+```
+
+
+```{r}
+model.glm <- readRDS("../../RDSs/paper/modelos_predictivos/model_AR_glm_10cv10rep_maaslin.RDS")
+
+resample <- model.glm$resample
+resample$algoritmo <- "glm"
+
+if (nrow(resamples_train) == 0){
+    
+    resamples_train <- resample
+    
+} else {
+    resamples_train <- rbind(resamples_train, resample)
+    
+}
+```
+
+
+
+#### Naive bayes
+
+```{r}
+modelLookup("naive_bayes")
+```
+
+```{r, eval=FALSE}
+set.seed(1234)
+
+mygrid <- expand.grid(laplace = seq(0, 1, 0.2),
+                      usekernel = c(T, F),
+                      adjust = seq(0.2, 2.2, 0.4))
+
+model.nb <- train(AR ~ ., data = train_data_smote, 
+               method = "naive_bayes",
+               metric = "ROC",
+               trControl = ctrl,
+               tuneGrid=mygrid
+               )
+
+saveRDS(model.nb, "../../RDSs/paper/modelos_predictivos/model_AR_nb_10cv10rep_maaslin.RDS")
+```
+
+```{r}
+model.nb <- readRDS("../../RDSs/paper/modelos_predictivos/model_AR_nb_10cv10rep_maaslin.RDS")
+
+resample <- model.nb$resample
+resample$algoritmo <- "naive-bayes"
+
+if (nrow(resamples_train) == 0){
+    
+    resamples_train <- resample
+    
+} else {
+    resamples_train <- rbind(resamples_train, resample)
+    
+}
+```
+
+```{r}
+plot(model.nb)
+model.nb$bestTune
+```
+
+
+```{r}
+p1 <- ggplot(data = resamples_train, aes(y = Accuracy, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1,color = "#8B1A1A") +
+    geom_jitter(aes(y = Accuracy, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Accuracy",
+       x = "Accuracy", y = "") +
+    theme(legend.position = "none")
+ 
+p2 <- ggplot(data = resamples_train, aes(y = Kappa, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1, color = "#8B1A1A") +
+    geom_jitter(aes(y = Kappa, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Kappa",
+       x = "Kappa", y = "") +
+    theme(legend.position = "none")
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+#### kknn
+
+```{r}
+modelLookup("kknn")
+```
+
+
+```{r, eval=FALSE}
+set.seed(1234)
+
+mygrid <- expand.grid(kmax = seq(5,9,2),
+                      distance = c(1,2,3),
+                      kernel = c("rectangular","triangular",
+                                 "optimal" 
+                                  ,"epanechnikov", "biweight", "triweight" 
+                                  ,"cos", "inv", "gaussian","rank"
+                                ))
+
+model.kknn <- train(y=train_data_smote$AR, x=train_data_smote[, !colnames(train_data_smote) %in% "AR"], 
+               method = "kknn",
+               metric = "ROC",
+               trControl = ctrl,
+               tuneGrid = mygrid
+               )
+
+saveRDS(model.kknn, "../../RDSs/paper/modelos_predictivos/model_AR_kknn_10cv10rep_maaslin.RDS")
+```
+
+```{r}
+model.kknn <- readRDS("../../RDSs/paper/modelos_predictivos/model_AR_kknn_10cv10rep_maaslin.RDS")
+
+resample <- model.kknn$resample
+resample$algoritmo <- "kknn"
+
+if (nrow(resamples_train) == 0){
+    
+    resamples_train <- resample
+    
+} else {
+    resamples_train <- rbind(resamples_train, resample)
+    
+}
+```
+
+```{r}
+plot(model.kknn)
+model.kknn$bestTune
+```
+
+
+```{r}
+p1 <- ggplot(data = resamples_train, aes(y = Accuracy, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1,color = "#8B1A1A") +
+    geom_jitter(aes(y = Accuracy, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Accuracy",
+       x = "Accuracy", y = "") +
+    theme(legend.position = "none")
+ 
+p2 <- ggplot(data = resamples_train, aes(y = Kappa, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1, color = "#8B1A1A") +
+    geom_jitter(aes(y = Kappa, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Kappa",
+       x = "Kappa", y = "") +
+    theme(legend.position = "none")
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+
+#### random forest
+
+```{r}
+modelLookup("rf")
+```
+
+
+```{r, eval=FALSE}
+set.seed(1234)
+
+mygrid <- expand.grid(mtry = c(2:round(sqrt(ncol(train_data_smote)))),
+                      splitrule = c("gini", "extratrees"),
+                      min.node.size = 1)
+
+trees <- seq(500, 2000, 500) 
+
+modelos_rf <- list() # lista vacia para meter los resultados de cada bucle
+for (tree in trees){ # bucle en cada pasada hace un modelo con un número de arboles distintos
+  modelo <- train(AR~.,data=train_data_smote,
+                  method="ranger",
+                  tuneGrid=mygrid,
+                  trControl=ctrl, 
+                  ntree = tree
+  )
+  modelos_rf[[paste(tree)]] <- modelo # metemos el modelo en la lista
+}
+
+saveRDS(modelos_rf, "../../RDSs/paper/modelos_predictivos/model_AR_rf_10cv10rep_maaslin.RDS")
+```
+
+```{r, fig.width=8, fig.height= 5}
+modelos_rf <- readRDS("../../RDSs/paper/modelos_predictivos/model_AR_rf_10cv10rep_maaslin.RDS")
+
+datos_combinados <- data.frame()
+for (i in names(modelos_rf)){
+    
+    if (nrow(datos_combinados) == 0 ){
+        
+       datos_combinados <- data.frame(mtry = modelos_rf[[i]]$results$mtry, 
+                                      splitrule = modelos_rf[[i]]$results$splitrule, 
+                                      MetricValue = modelos_rf[[i]]$results$Accuracy, 
+                                      Trees = i, 
+                                      Metric = "Accuracy")
+        
+    } else {
+        
+        tmp <- data.frame(mtry = modelos_rf[[i]]$results$mtry, 
+                          splitrule = modelos_rf[[i]]$results$splitrule, 
+                          MetricValue = modelos_rf[[i]]$results$Accuracy, 
+                          Trees = i, 
+                          Metric = "Accuracy")
+        
+        datos_combinados <- rbind(datos_combinados, tmp)
+        
+    }
+}
+
+#datos_combinados$Trees <- factor(datos_combinados$Trees, levels = c("500 trees", "1000 trees", "1500 trees", "2000 trees"))
+
+datos_combinados %>%
+    # filter(splitrule == "extratrees") %>%
+    filter(Metric == "Accuracy") %>%
+    ggplot(aes(x = mtry, y = MetricValue, color = Trees)) +
+    geom_point(size = 4) +
+    #scale_color_manual(values = c("#C19A6B", "#A3C9A8", "#5B9279", "#264E36")) +
+    geom_line(linetype = "dashed") +
+    theme_minimal() +
+    labs(x = "Mtry", y = "Accuracy", title = "train RF") +
+    facet_wrap(~ splitrule)
+ 
+```
+
+```{r, fig.width=8, fig.height= 5}
+datos_combinados <- data.frame()
+for (i in names(modelos_rf)){
+    
+    if (nrow(datos_combinados) == 0 ){
+        
+       datos_combinados <- data.frame(mtry = modelos_rf[[i]]$results$mtry, 
+                                      splitrule = modelos_rf[[i]]$results$splitrule, 
+                                      MetricValue = modelos_rf[[i]]$results$Kappa, 
+                                      Trees = i, 
+                                      Metric = "Kappa")
+        
+    } else {
+        
+        tmp <- data.frame(mtry = modelos_rf[[i]]$results$mtry, 
+                          splitrule = modelos_rf[[i]]$results$splitrule, 
+                          MetricValue = modelos_rf[[i]]$results$Kappa, 
+                          Trees = i, 
+                          Metric = "Kappa")
+        
+        datos_combinados <- rbind(datos_combinados, tmp)
+        
+    }
+}
+
+#datos_combinados$Trees <- factor(datos_combinados$Trees, levels = c("500 trees", "1000 trees", "1500 trees", "2000 trees"))
+
+datos_combinados %>%
+    # filter(splitrule == "extratrees") %>%
+    filter(Metric == "Kappa") %>%
+    ggplot(aes(x = mtry, y = MetricValue, color = Trees)) +
+    geom_point(size = 4) +
+    #scale_color_manual(values = c("#C19A6B", "#A3C9A8", "#5B9279", "#264E36")) +
+    geom_line(linetype = "dashed") +
+    theme_minimal() +
+    labs(x = "Mtry", y = "Accuracy", title = "train RF") +
+    facet_wrap(~ splitrule)
+ 
+```
+
+```{r}
+
+resample <- modelos_rf$'2000'$resample
+resample$algoritmo <- "rf"
+
+if (nrow(resamples_train) == 0){
+    
+    resamples_train <- resample
+    
+} else {
+    resamples_train <- rbind(resamples_train, resample)
+    
+}
+```
+
+```{r}
+plot(modelos_rf$'2000')
+modelos_rf$'2000'$bestTune
+```
+
+
+```{r}
+p1 <- ggplot(data = resamples_train, aes(y = Accuracy, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1,color = "#8B1A1A") +
+    geom_jitter(aes(y = Accuracy, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Accuracy",
+       x = "Accuracy", y = "") +
+    theme(legend.position = "none")
+ 
+p2 <- ggplot(data = resamples_train, aes(y = Kappa, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1, color = "#8B1A1A") +
+    geom_jitter(aes(y = Kappa, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Kappa",
+       x = "Kappa", y = "") +
+    theme(legend.position = "none")
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+#### XGboost
+
+```{r}
+modelLookup("xgbTree")
+```
+
+
+```{r, eval=FALSE}
+set.seed(1234)
+
+tune_grid <- expand.grid(
+    nrounds = seq(50, 300, 50) ,
+    max_depth = seq(2, 10, 4) ,
+    # colsample_bytree = seq(0.2, 1, 0.2),
+    # eta = seq(0.05, 0.3, 0.05),
+    # gamma = seq(0, 0.5, 0.1),
+    # min_child_weight = seq(0, 10, 2),
+    # subsample = seq(0.5, 1, 0.1)
+    colsample_bytree = 0.5,
+    eta = 0.15,
+    gamma = 0.1,
+    min_child_weight = 5,
+    subsample = 0.5
+)
+
+# Train the model
+model <- train(y=train_data_smote$AR, x=train_data_smote[, !colnames(train_data_smote) %in% "AR"],
+    method = "xgbTree",
+    metric = "ROC",
+    tuneGrid = tune_grid,
+    trControl = ctrl
+)
+
+plot(model)
+```
+
+```{r, eval=FALSE}
+set.seed(1234)
+
+tune_grid <- expand.grid(
+    nrounds = 300 ,
+    max_depth = 6 ,
+    colsample_bytree = seq(0.2, 1, 0.2),
+    eta = seq(0.05, 0.3, 0.05),
+    # gamma = seq(0, 0.5, 0.1),
+    # min_child_weight = seq(0, 10, 2),
+    # subsample = seq(0.5, 1, 0.1)
+    gamma = 0.1,
+    min_child_weight = 5,
+    subsample = 0.5
+)
+
+# Train the model
+model <- train(y=train_data_smote$AR, x=train_data_smote[, !colnames(train_data_smote) %in% "AR"],
+    method = "xgbTree",
+    metric = "ROC",
+    tuneGrid = tune_grid,
+    trControl = ctrl
+)
+
+plot(model)
+
+```
+
+```{r, eval=FALSE}
+set.seed(1234)
+
+tune_grid <- expand.grid(
+    nrounds = 300 ,
+    max_depth = 6 ,
+    colsample_bytree = 0.4,
+    eta = 0.1,
+    gamma = seq(0, 0.5, 0.1),
+    min_child_weight = seq(0, 10, 2),
+    # subsample = seq(0.5, 1, 0.1)
+    subsample = 0.5
+)
+
+# Train the model
+model <- train(y=train_data_smote$AR, x=train_data_smote[, !colnames(train_data_smote) %in% "AR"],
+    method = "xgbTree",
+    metric = "ROC",
+    tuneGrid = tune_grid,
+    trControl = ctrl
+)
+
+plot(model)
+
+```
+
+```{r, eval=FALSE}
+set.seed(1234)
+
+tune_grid <- expand.grid(
+    nrounds = 300 ,
+    max_depth = 6 ,
+    colsample_bytree = 0.4,
+    eta = 0.1,
+    gamma = 0,
+    min_child_weight = 0,
+    subsample = seq(0.5, 1, 0.1)
+)
+
+# Train the model
+model.xgb <- train(y=train_data_smote$AR, x=train_data_smote[, !colnames(train_data_smote) %in% "AR"],
+    method = "xgbTree",
+    metric = "ROC",
+    tuneGrid = tune_grid,
+    trControl = ctrl
+)
+
+saveRDS(model.xgb, "../../RDSs/paper/modelos_predictivos/model_AR_xgb_10cv10rep_maaslin.RDS")
+```
+
+```{r}
+model.xgb <- readRDS("../../RDSs/paper/modelos_predictivos/model_AR_xgb_10cv10rep_maaslin.RDS")
+
+resample <- model.xgb$resample
+resample$algoritmo <- "xgb"
+
+if (nrow(resamples_train) == 0){
+    
+    resamples_train <- resample
+    
+} else {
+    resamples_train <- rbind(resamples_train, resample)
+    
+}
+```
+
+```{r}
+plot(model.xgb)
+model.xgb$bestTune
+```
+
+```{r}
+p1 <- ggplot(data = resamples_train, aes(y = Accuracy, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1,color = "#8B1A1A") +
+    geom_jitter(aes(y = Accuracy, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Accuracy",
+       x = "Accuracy", y = "") +
+    theme(legend.position = "none")
+ 
+p2 <- ggplot(data = resamples_train, aes(y = Kappa, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1, color = "#8B1A1A") +
+    geom_jitter(aes(y = Kappa, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Kappa",
+       x = "Kappa", y = "") +
+    theme(legend.position = "none")
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+#### SVM linear
+
+```{r, eval=FALSE}
+set.seed(1234)
+
+mygrid <- expand.grid(C = c(0.01, 0.1, 1, 10))
+
+model.svmlinear <- train(AR~ ., data=train_data_smote, 
+               method = "svmLinear",
+               metric = "ROC",
+               trControl = ctrl,
+               tuneGrid = mygrid
+               )
+
+saveRDS(model.svmlinear, "../../RDSs/paper/modelos_predictivos/model_AR_svml_10cv10rep_maaslin.RDS")
+```
+
+```{r}
+model.svmlinear <- readRDS("../../RDSs/paper/modelos_predictivos/model_AR_svml_10cv10rep_maaslin.RDS")
+
+resample <- model.svmlinear$resample
+resample$algoritmo <- "svm lineal"
+
+if (nrow(resamples_train) == 0){
+    
+    resamples_train <- resample
+    
+} else {
+    resamples_train <- rbind(resamples_train, resample)
+    
+}
+```
+
+```{r}
+plot(model.svmlinear)
+model.svmlinear$bestTune
+```
+
+
+```{r}
+p1 <- ggplot(data = resamples_train, aes(y = Accuracy, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1,color = "#8B1A1A") +
+    geom_jitter(aes(y = Accuracy, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Accuracy",
+       x = "Accuracy", y = "") +
+    theme(legend.position = "none")
+ 
+p2 <- ggplot(data = resamples_train, aes(y = Kappa, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1, color = "#8B1A1A") +
+    geom_jitter(aes(y = Kappa, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Kappa",
+       x = "Kappa", y = "") +
+    theme(legend.position = "none")
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+#### SVM Radial
+
+```{r, eval=FALSE}
+set.seed(1234)
+
+mygrid <- expand.grid(C = c(0.001, 0.01, 0.1, 1, 10), sigma = c(0.001, 0.01, 0.1, 1, 10))
+
+model.svmradial<- train(AR~ ., data=train_data_smote, 
+               method = "svmRadial",
+               metric = "ROC",
+               trControl = ctrl,
+               tuneGrid = mygrid
+               )
+
+saveRDS(model.svmradial, "../../RDSs/paper/modelos_predictivos/model_AR_svmr_10cv10rep_maaslin.RDS")
+```
+
+```{r}
+model.svmradial <- readRDS("../../RDSs/paper/modelos_predictivos/model_AR_svmr_10cv10rep_maaslin.RDS")
+
+resample <- model.svmradial$resample
+resample$algoritmo <- "svm radial"
+
+if (nrow(resamples_train) == 0){
+    
+    resamples_train <- resample
+    
+} else {
+    resamples_train <- rbind(resamples_train, resample)
+    
+}
+```
+
+```{r}
+plot(model.svmradial)
+model.svmradial$bestTune
+```
+
+
+```{r}
+p1 <- ggplot(data = resamples_train, aes(y = Accuracy, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1,color = "#8B1A1A") +
+    geom_jitter(aes(y = Accuracy, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Accuracy",
+       x = "Accuracy", y = "") +
+    theme(legend.position = "none")
+ 
+p2 <- ggplot(data = resamples_train, aes(y = Kappa, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1, color = "#8B1A1A") +
+    geom_jitter(aes(y = Kappa, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Kappa",
+       x = "Kappa", y = "") +
+    theme(legend.position = "none")
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+#### SVM Polinomial
+
+```{r}
+modelLookup(("svmPoly"))
+```
+
+
+```{r, eval=FALSE}
+set.seed(1234)
+
+mygrid <- expand.grid(C = c(0.001, 0.01, 0.1, 1, 10), 
+                      degree = seq(2, 4, 1),
+                      scale = seq(0.001, 0.05, 0.01))
+
+model.svmpoly<- train(AR~ ., data=train_data_smote, 
+               method = "svmPoly",
+               metric = "ROC",
+               trControl = ctrl,
+               tuneGrid = mygrid
+               )
+
+saveRDS(model.svmpoly, "../../RDSs/paper/modelos_predictivos/model_AR_svmp_10cv10rep_maaslin.RDS")
+```
+
+```{r}
+model.svmpoly <- readRDS("../../RDSs/paper/modelos_predictivos/model_AR_svmp_10cv10rep_maaslin.RDS")
+
+resample <- model.svmpoly$resample
+resample$algoritmo <- "svm polinomial"
+
+if (nrow(resamples_train) == 0){
+    
+    resamples_train <- resample
+    
+} else {
+    resamples_train <- rbind(resamples_train, resample)
+    
+}
+```
+
+```{r}
+plot(model.svmpoly)
+model.svmpoly$bestTune
+```
+
+
+```{r}
+p1 <- ggplot(data = resamples_train, aes(y = Accuracy, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1,color = "#8B1A1A") +
+    geom_jitter(aes(y = Accuracy, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Accuracy",
+       x = "Accuracy", y = "") +
+    theme(legend.position = "none")
+ 
+p2 <- ggplot(data = resamples_train, aes(y = Kappa, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1, color = "#8B1A1A") +
+    geom_jitter(aes(y = Kappa, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Kappa",
+       x = "Kappa", y = "") +
+    theme(legend.position = "none")
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+#### MLP
+
+```{r}
+modelLookup("mlpWeightDecay")
+```
+
+```{r, eval=FALSE}
+set.seed(1234)
+
+mygrid <- expand.grid(size = seq(1, 10, 1), 
+                      decay = c(0.0001, 0.001, 0.01, 0.1, 1))
+
+model.mlp<- train(AR~ ., data=train_data_smote, 
+               method = "mlpWeightDecay",
+               metric = "ROC",
+               trControl = ctrl,
+               tuneGrid = mygrid
+               )
+
+saveRDS(model.mlp, "../../RDSs/paper/modelos_predictivos/model_AR_mlp_10cv10rep_maaslin.RDS")
+```
+
+```{r}
+model.mlp <- readRDS("../../RDSs/paper/modelos_predictivos/model_AR_mlp_10cv10rep_maaslin.RDS")
+
+resample <- model.mlp$resample
+resample$algoritmo <- "mlpWeightDecay"
+
+if (nrow(resamples_train) == 0){
+    
+    resamples_train <- resample
+     
+} else {
+    resamples_train <- rbind(resamples_train, resample)
+    
+}
+```
+
+```{r}
+plot(model.mlp)
+model.mlp$bestTune
+```
+
+
+```{r, fig.width=10, fig.height=10}
+p1 <- ggplot(data = resamples_train, aes(y = Accuracy, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1,color = "#8B1A1A") +
+    geom_jitter(aes(y = Accuracy, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Accuracy",
+       x = "Accuracy", y = "") +
+    theme(
+        legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 0.5, vjust = 0.5)
+        )
+ 
+p2 <- ggplot(data = resamples_train, aes(y = Kappa, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1, color = "#8B1A1A") +
+    geom_jitter(aes(y = Kappa, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Kappa",
+       x = "Kappa", y = "") +
+    theme(legend.position = "none")
+
+grid.arrange(p1, p2, ncol = 1)
+```
+```{r, fig.width=5, fig.height=5}
+orden_algoritmos <- c("GLM", "Naïve Bayes", "k-NN", "RF", "XGBoost", "SVM Lineal", "SVM Radial", "SVM Polinomial", "MLP")
+
+nombres_equivalentes <- c("glm" = "GLM",
+                          "naive-bayes" = "Naïve Bayes",
+                          "kknn" = "k-NN",
+                          "rf" = "RF",
+                          "xgb" = "XGBoost",
+                          "svm lineal" = "SVM Lineal",
+                          "svm radial" = "SVM Radial",
+                            "svm polinomial" = "SVM Polinomial",
+                          "mlpWeightDecay" = "MLP")
+
+resamples_train <- resamples_train %>%
+    mutate(algoritmo = recode(algoritmo, !!!nombres_equivalentes)) %>%
+    mutate(algoritmo = factor(algoritmo, levels = orden_algoritmos)) %>%
+    arrange(algoritmo)
+
+
+p1 <- ggplot(data = resamples_train, aes(y = Accuracy, x = algoritmo, fill = algoritmo)) +
+    geom_boxplot(fill = "#8B1A1A",alpha = 0.5) +
+    theme_minimal() +
+    labs(
+        title = "",
+        x = "", 
+        y = "Accuracy"
+        ) +
+    theme(
+        legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, face = "bold", size = 10)
+        ) +
+    ylim(c(0,1))
+ 
+# p2 <- ggplot(data = resamples_train, aes(y = Kappa, x = algoritmo, fill = algoritmo)) +
+#   geom_boxplot(size = 1, color = "#8B1A1A") +
+#     geom_jitter(aes(y = Kappa, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+#   theme_minimal() +
+#   labs(title = "Kappa",
+#        x = "Kappa", y = "") +
+#     theme(legend.position = "none")
+# 
+# grid.arrange(p1, p2, ncol = 1)
+
+p1
+```
+
+#### Prediction
+
+```{r}
+probs_glm <- predict(model.glm, testSet, type = "prob")[, 2]
+
+probs_nb <- predict(model.nb, testSet, type = "prob")[, 2]
+
+probs_kknn<- predict(model.kknn, testSet, type = "prob")[, 2]
+
+probs_rf<- predict(modelos_rf$`500`, testSet, type = "prob")[, 2]
+
+probs_xgb <- predict(model.xgb, testSet, type = "prob")[, 2]
+
+probs_svmlinear<- predict(model.svmlinear, testSet, type = "prob")[, 2]
+
+probs_svmpoly<- predict(model.svmpoly, testSet, type = "prob")[, 2]
+
+probs_svmradial<- predict(model.svmradial, testSet, type = "prob")[, 2]
+
+probs_mlp<- predict(model.mlp, testSet, type = "prob")[, 2]
+```
+
+```{r}
+library(pROC)
+
+# Calcula las curvas ROC para cada modelo
+roc_glm <- roc(testSet$AR, probs_glm, levels = rev(levels(testSet$AR)))
+roc_nb <- roc(testSet$AR, probs_nb, levels = rev(levels(testSet$AR)))
+roc_kknn <- roc(testSet$AR, probs_kknn, levels = rev(levels(testSet$AR)))
+roc_rf <- roc(testSet$AR, probs_rf, levels = rev(levels(testSet$AR)))
+roc_xgb <- roc(testSet$AR, probs_xgb, levels = rev(levels(testSet$AR)))
+roc_svmlinear <- roc(testSet$AR, probs_svmlinear, levels = rev(levels(testSet$AR)))
+roc_svmpoly <- roc(testSet$AR, probs_svmpoly, levels = rev(levels(testSet$AR)))
+roc_svmradial <- roc(testSet$AR, probs_svmradial, levels = rev(levels(testSet$AR)))
+roc_mlp <- roc(testSet$AR, probs_mlp, levels = rev(levels(testSet$AR)))
+```
+
+```{r}
+auc_values_survival <- c(
+  GLM = auc(roc_glm),
+  Naive_Bayes = auc(roc_nb),
+  kNN = auc(roc_kknn),
+  Random_Forest = auc(roc_rf),
+  XGBoost = auc(roc_xgb),
+  SVM_Linear = auc(roc_svmlinear),
+  SVM_Poly = auc(roc_svmpoly),
+  SVM_Radial = auc(roc_svmradial),
+  MLP = auc(roc_mlp)
+)
+
+# Mostrar los AUC
+print("AUC de los modelos:")
+print(sort(auc_values_survival, decreasing = TRUE))
+```
+
+```{r, fig.width=10, fig.height=8}
+# Crear una lista con las curvas ROC
+roc_list <- list(
+  GLM = roc_glm,
+  "Naive Bayes" = roc_nb,
+  kNN = roc_kknn,
+  "Random Forest" = roc_rf,
+  XGBoost = roc_xgb,
+  "SVM Linear" = roc_svmlinear,
+  "SVM Polynomial" = roc_svmpoly,
+  "SVM Radial" = roc_svmradial,
+  MLP = roc_mlp
+)
+
+model_labels <- paste0(names(auc_values_survival), " (AUC=", round(auc_values_survival, 2), ")")
+
+roc_list_a <- roc_list[!names(roc_list) %in% c("Random Forest", "XGBoost")]
+model_labels_a <- model_labels[!model_labels %in% c("Random_Forest (AUC=0.96)", "XGBoost (AUC=0.96)")]
+
+colores <- c("grey80", "#C71000FF",  "#008EA0FF", 
+             #"#FF6348F0",  "#5A9599FF", 
+             "#8A4198FF", "#84D7E1FF", "#FF95A8FF", "#3D3B25FF"
+             )
+
+# Convertir las curvas en un formato adecuado para ggroc
+aucs_ar <- ggroc(roc_list_a) +
+    geom_line(size = 2) + 
+    geom_abline(slope = 1, intercept = 1, linetype = "dashed", color = "gray") +
+    scale_color_manual(values = colores,
+                       labels = model_labels_a ) +
+      theme_minimal() +
+      labs(
+        x = "1 - Specificity",
+        y = "Sensitivity",
+        color = "Model"
+      ) +
+    theme(
+        text = element_text(size = 20),
+        legend.position = "bottom",
+        legend.title = element_blank(),
+        legend.text = element_text(size = 14)
+    ) +
+    guides(
+        color = guide_legend(
+        ncol = 3,
+        override.aes = list(size = 10)  
+        )
+    )
+
+
+aucs_ar
+```
+
+```{r, fig.width=8, fig.height=6}
+roc_list_b <- roc_list[names(roc_list) %in% c("Random Forest", "XGBoost")]
+model_labels_b <- model_labels[model_labels %in% c("Random_Forest (AUC=0.96)", "XGBoost (AUC=0.96)")]
+
+colores <- c(#"grey80", "#C71000FF",  "#008EA0FF", 
+             "#FF6348F0",  "#5A9599FF"
+             # "#8A4198FF", "#84D7E1FF", "#FF95A8FF", "#3D3B25FF"
+             )
+
+# Convertir las curvas en un formato adecuado para ggroc
+aucs_ar <- ggroc(roc_list_b) +
+    geom_line(size = 2) + 
+    geom_abline(slope = 1, intercept = 1, linetype = "dashed", color = "gray") +
+    scale_color_manual(values = colores,
+                       labels = model_labels_b ) +
+      theme_minimal() +
+      labs(
+        x = "1 - Specificity",
+        y = "Sensitivity",
+        color = "Model"
+      ) +
+    theme(
+        text = element_text(size = 20),
+        legend.position = "bottom",
+        legend.title = element_blank(),
+        legend.text = element_text(size = 14)
+    ) +
+    guides(
+        color = guide_legend(
+        ncol = 3,
+        override.aes = list(size = 10)  
+        )
+    )
+
+
+aucs_ar
+```
+
+
+```{r}
+set.seed(1234)
+pred_glm <- predict(model.glm, testSet)
+
+pred_nb <- predict(model.nb, testSet)
+
+pred_kknn<- predict(model.kknn, testSet)
+
+pred_rf<- predict(modelos_rf$`500`, testSet)
+
+pred_xgb <- predict(model.xgb, testSet)
+
+pred_svmlinear<- predict(model.svmlinear, testSet)
+
+pred_svmpoly<- predict(model.svmpoly, testSet)
+
+pred_svmradial<- predict(model.svmradial, testSet)
+
+pred_mlp<- predict(model.mlp, testSet)
+
+
+```
+
+```{r, fig.width=10, fig.height=11}
+conf_list <- list(
+    GLM = pred_glm,
+    "Naive Bayes" = pred_nb,
+    kNN = pred_kknn,
+    "Random Forest" = pred_rf,
+    XGBoost = pred_xgb,
+    "SVM Linear" = pred_svmlinear,
+    "SVM Polynomial" = pred_svmpoly,
+    "SVM Radial" = pred_svmradial,
+    MLP = pred_mlp
+)
+
+plots <- list()
+
+for (i in names(conf_list)){
+    conf_matrix <- confusionMatrix(conf_list[[i]], testSet$AR)
+    
+    
+    cm_df <- as.data.frame(conf_matrix$table)
+    cm_df$match <- ifelse(cm_df$Prediction == cm_df$Reference, cm_df$Freq, -cm_df$Freq)  
+    p <- ggplot(cm_df, aes(x = factor(Prediction, levels = c("NO", "YES")),  
+                            y = factor(Reference, levels = c("YES", "NO")),  
+                            fill = match)) +  
+        geom_tile() +  
+        geom_text(aes(label = Freq), color = "black", size = 4) +
+        scale_fill_gradient2(low = "#CD3333", mid = "white", high = "darkseagreen1", 
+                             midpoint = 0) +  # 0 es el punto medio entre errores/aciertos
+        labs(
+            title = i, 
+            subtitle = paste0("Balanced Accuracy: ", round(conf_matrix$byClass[["Balanced Accuracy"]], 2),
+                              "\nF1-score: ", round(conf_matrix$byClass[["F1"]], 2),
+                              "     Specifity: ", round(conf_matrix$byClass[["Specificity"]], 2)),
+            x = "Predict", 
+            y = "Real"
+        ) +
+        theme_minimal() + 
+        theme(
+            legend.position = "none",  # Mostrar la leyenda para ver la escala de colores
+            plot.margin = margin(20,20,20,20)
+        )
+
+    
+    plots[[i]] <- p
+    
+}
+    
+
+cowplot::plot_grid(plotlist = plots[!names(plots) %in% c("Random Forest", "XGBoost")])
+
+```
+
+```{r, fig.width=8, fig.height=4}
+cowplot::plot_grid(plotlist = plots[names(plots) %in% c("Random Forest", "XGBoost")])
+```
+
+
+
+## Survival
+
+```{r}
+df_genus_prevalente <- assay(tse_prevalente, "relabundance")
+
+taxones <- dda_maaslin_prevalente$Survival |> 
+    dplyr::filter(pval < 0.05) |>
+    pull(feature)
+
+# Añadir la variables de salida
+df_genus_prevalente <- df_genus_prevalente |> 
+    t()|> 
+    as.data.frame() |>
+    dplyr::select(all_of(taxones))
+
+df_genus_prevalente$Survival <- colData(tse_prevalente)$Survival
+```
+
+### Data partition
+
+```{r}
+set.seed(1234)
+
+train.Idx.80<- createDataPartition(df_genus_prevalente$Survival,
+                                       p=0.7, #Genera un 80% para train, 20% para test
+                                       list = FALSE, # resultados en una matriz
+                                       times = 1) #Genera solamente una partición 80/20
+
+trainSet<- df_genus_prevalente[train.Idx.80, ]
+testSet <- df_genus_prevalente[-train.Idx.80, ]
+
+table(trainSet$Survival)
+table(testSet$Survival)
+```
+
+### SMOTE
+
+```{r}
+set.seed(1234)
+smote_result <- SMOTE(X = trainSet[, -which(names(trainSet) == "Survival")], # Variables predictoras
+                      target = trainSet$Survival,                             # Variable de salida
+                      K = 10,                                             # Vecinos más cercanos
+                      dup_size = 2)  
+
+train_data_smote <- smote_result$data
+names(train_data_smote)[ncol(train_data_smote)] <- "Survival" # Renombrar la columna de salida
+train_data_smote$Survival <- as.factor(train_data_smote$Survival) 
+
+table(train_data_smote$Survival)
+
+```
+
+### Modelos entrenamientos
+
+```{r}
+resamples_train <- data.frame()
+```
+
+#### GLM
+
+```{r,eval=FALSE}
+set.seed(1234)
+model.glm <- train(Survival ~ ., data = train_data_smote, 
+               method = "glm", 
+               family = "binomial",                    # Especificar regresión logística
+               metric = "ROC",                         # Optimizar usando el área bajo la curva ROC
+               trControl = ctrl)
+
+saveRDS(model.glm, "../../RDSs/paper/modelos_predictivos/model_Survival_glm_10cv10rep_maaslin.RDS")
+```
+
+```{r}
+model.glm <- readRDS("../../RDSs/paper/modelos_predictivos/model_Survival_glm_10cv10rep_maaslin.RDS")
+
+resample <- model.glm$resample
+resample$algoritmo <- "glm"
+
+if (nrow(resamples_train) == 0){
+    
+    resamples_train <- resample
+    
+} else {
+    resamples_train <- rbind(resamples_train, resample)
+    
+}
+
+```
+
+#### Naive bayes
+
+```{r}
+modelLookup("naive_bayes")
+```
+
+```{r,eval=FALSE}
+set.seed(1234)
+
+mygrid <- expand.grid(laplace = seq(0, 1, 0.2),
+                      usekernel = c(T, F),
+                      adjust = seq(0.2, 2.2, 0.4))
+
+model.nb <- train(Survival ~ ., data = train_data_smote, 
+               method = "naive_bayes",
+               metric = "ROC",
+               trControl = ctrl,
+               tuneGrid=mygrid
+               )
+
+saveRDS(model.nb, "../../RDSs/paper/modelos_predictivos/model_Survival_nb_10cv10rep_maaslin.RDS")
+```
+
+```{r}
+model.nb <- readRDS("../../RDSs/paper/modelos_predictivos/model_Survival_nb_10cv10rep_maaslin.RDS")
+
+resample <- model.nb$resample
+resample$algoritmo <- "naive-bayes"
+
+if (nrow(resamples_train) == 0){
+    
+    resamples_train <- resample
+    
+} else {
+    resamples_train <- rbind(resamples_train, resample)
+    
+}
+```
+
+```{r}
+plot(model.nb)
+model.nb$bestTune
+```
+
+
+```{r}
+p1 <- ggplot(data = resamples_train, aes(y = Accuracy, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1,color = "#8B1A1A") +
+    geom_jitter(aes(y = Accuracy, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Accuracy",
+       x = "Accuracy", y = "") +
+    theme(legend.position = "none")
+ 
+p2 <- ggplot(data = resamples_train, aes(y = Kappa, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1, color = "#8B1A1A") +
+    geom_jitter(aes(y = Kappa, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Kappa",
+       x = "Kappa", y = "") +
+    theme(legend.position = "none")
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+#### kknn
+
+```{r}
+modelLookup("kknn")
+```
+
+
+```{r, eval=FALSE}
+set.seed(1234)
+
+mygrid <- expand.grid(kmax = seq(5,9,2),
+                      distance = c(1,2,3),
+                      kernel = c("rectangular","triangular",
+                                 "optimal" 
+                                  ,"epanechnikov", "biweight", "triweight" 
+                                  ,"cos", "inv", "gaussian","rank"
+                                ))
+
+model.kknn <- train(y=train_data_smote$Survival, x=train_data_smote[, !colnames(train_data_smote) %in% "Survival"], 
+               method = "kknn",
+               metric = "ROC",
+               trControl = ctrl,
+               tuneGrid = mygrid
+               )
+
+saveRDS(model.kknn, "../../RDSs/paper/modelos_predictivos/model_Survival_kknn_10cv10rep_maaslin.RDS")
+```
+
+```{r}
+model.kknn <- readRDS("../../RDSs/paper/modelos_predictivos/model_Survival_kknn_10cv10rep_maaslin.RDS")
+
+resample <- model.kknn$resample
+resample$algoritmo <- "kknn"
+
+if (nrow(resamples_train) == 0){
+    
+    resamples_train <- resample
+    
+} else {
+    resamples_train <- rbind(resamples_train, resample)
+    
+}
+```
+
+```{r}
+plot(model.kknn)
+model.kknn$bestTune
+```
+
+
+```{r}
+p1 <- ggplot(data = resamples_train, aes(y = Accuracy, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1,color = "#8B1A1A") +
+    geom_jitter(aes(y = Accuracy, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Accuracy",
+       x = "Accuracy", y = "") +
+    theme(legend.position = "none")
+ 
+p2 <- ggplot(data = resamples_train, aes(y = Kappa, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1, color = "#8B1A1A") +
+    geom_jitter(aes(y = Kappa, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Kappa",
+       x = "Kappa", y = "") +
+    theme(legend.position = "none")
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+
+#### random forest
+
+```{r}
+modelLookup("rf")
+```
+
+
+```{r, eval=FALSE}
+set.seed(1234)
+
+mygrid <- expand.grid(mtry = c(2:round(sqrt(ncol(train_data_smote)))),
+                      splitrule = c("gini", "extratrees"),
+                      min.node.size = 1)
+
+trees <- seq(500, 2000, 500) 
+
+modelos_rf <- list() # lista vacia para meter los resultados de cada bucle
+for (tree in trees){ # bucle en cada pasada hace un modelo con un número de arboles distintos
+  modelo <- train(Survival~.,data=train_data_smote,
+                  method="ranger",
+                  tuneGrid=mygrid,
+                  trControl=ctrl, 
+                  ntree = tree
+  )
+  modelos_rf[[paste(tree)]] <- modelo # metemos el modelo en la lista
+}
+
+saveRDS(modelos_rf, "../../RDSs/paper/modelos_predictivos/model_Survival_rf_10cv10rep_maaslin.RDS")
+```
+
+```{r, fig.width=8, fig.height= 5}
+modelos_rf <- readRDS("../../RDSs/paper/modelos_predictivos/model_Survival_rf_10cv10rep_maaslin.RDS")
+datos_combinados <- data.frame()
+for (i in names(modelos_rf)){
+    
+    if (nrow(datos_combinados) == 0 ){
+        
+       datos_combinados <- data.frame(mtry = modelos_rf[[i]]$results$mtry, 
+                                      splitrule = modelos_rf[[i]]$results$splitrule, 
+                                      MetricValue = modelos_rf[[i]]$results$Accuracy, 
+                                      Trees = i, 
+                                      Metric = "Accuracy")
+        
+    } else {
+        
+        tmp <- data.frame(mtry = modelos_rf[[i]]$results$mtry, 
+                          splitrule = modelos_rf[[i]]$results$splitrule, 
+                          MetricValue = modelos_rf[[i]]$results$Accuracy, 
+                          Trees = i, 
+                          Metric = "Accuracy")
+        
+        datos_combinados <- rbind(datos_combinados, tmp)
+        
+    }
+}
+
+#datos_combinados$Trees <- factor(datos_combinados$Trees, levels = c("500 trees", "1000 trees", "1500 trees", "2000 trees"))
+
+datos_combinados %>%
+    # filter(splitrule == "extratrees") %>%
+    filter(Metric == "Accuracy") %>%
+    ggplot(aes(x = mtry, y = MetricValue, color = Trees)) +
+    geom_point(size = 4) +
+    #scale_color_manual(values = c("#C19A6B", "#A3C9A8", "#5B9279", "#264E36")) +
+    geom_line(linetype = "dashed") +
+    theme_minimal() +
+    labs(x = "Mtry", y = "Accuracy", title = "train RF") +
+    facet_wrap(~ splitrule)
+ 
+```
+
+```{r, fig.width=8, fig.height= 5}
+datos_combinados <- data.frame()
+for (i in names(modelos_rf)){
+    
+    if (nrow(datos_combinados) == 0 ){
+        
+       datos_combinados <- data.frame(mtry = modelos_rf[[i]]$results$mtry, 
+                                      splitrule = modelos_rf[[i]]$results$splitrule, 
+                                      MetricValue = modelos_rf[[i]]$results$Kappa, 
+                                      Trees = i, 
+                                      Metric = "Kappa")
+        
+    } else {
+        
+        tmp <- data.frame(mtry = modelos_rf[[i]]$results$mtry, 
+                          splitrule = modelos_rf[[i]]$results$splitrule, 
+                          MetricValue = modelos_rf[[i]]$results$Kappa, 
+                          Trees = i, 
+                          Metric = "Kappa")
+        
+        datos_combinados <- rbind(datos_combinados, tmp)
+        
+    }
+}
+
+#datos_combinados$Trees <- factor(datos_combinados$Trees, levels = c("500 trees", "1000 trees", "1500 trees", "2000 trees"))
+
+datos_combinados %>%
+    # filter(splitrule == "extratrees") %>%
+    filter(Metric == "Kappa") %>%
+    ggplot(aes(x = mtry, y = MetricValue, color = Trees)) +
+    geom_point(size = 4) +
+    #scale_color_manual(values = c("#C19A6B", "#A3C9A8", "#5B9279", "#264E36")) +
+    geom_line(linetype = "dashed") +
+    theme_minimal() +
+    labs(x = "Mtry", y = "Kappa", title = "train RF") +
+    facet_wrap(~ splitrule)
+ 
+```
+
+```{r}
+
+resample <- modelos_rf$'500'$resample
+resample$algoritmo <- "rf"
+
+if (nrow(resamples_train) == 0){
+    
+    resamples_train <- resample
+    
+} else {
+    resamples_train <- rbind(resamples_train, resample)
+    
+}
+```
+
+```{r}
+plot(modelos_rf$'500')
+modelos_rf$'500'$bestTune
+```
+
+
+```{r}
+p1 <- ggplot(data = resamples_train, aes(y = Accuracy, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1,color = "#8B1A1A") +
+    geom_jitter(aes(y = Accuracy, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Accuracy",
+       x = "Accuracy", y = "") +
+    theme(legend.position = "none")
+ 
+p2 <- ggplot(data = resamples_train, aes(y = Kappa, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1, color = "#8B1A1A") +
+    geom_jitter(aes(y = Kappa, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Kappa",
+       x = "Kappa", y = "") +
+    theme(legend.position = "none")
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+#### XGboost
+
+```{r}
+modelLookup("xgbTree")
+```
+
+
+```{r, eval=FALSE}
+set.seed(1234)
+
+tune_grid <- expand.grid(
+    nrounds = seq(50, 300, 50) ,
+    max_depth = seq(2, 10, 4) ,
+    # colsample_bytree = seq(0.2, 1, 0.2),
+    # eta = seq(0.05, 0.3, 0.05),
+    # gamma = seq(0, 0.5, 0.1),
+    # min_child_weight = seq(0, 10, 2),
+    # subsample = seq(0.5, 1, 0.1)
+    colsample_bytree = 0.5,
+    eta = 0.15,
+    gamma = 0.1,
+    min_child_weight = 5,
+    subsample = 0.5
+)
+
+# Train the model
+model <- train(y=train_data_smote$Survival, x=train_data_smote[, !colnames(train_data_smote) %in% "Survival"],
+    method = "xgbTree",
+    metric = "ROC",
+    tuneGrid = tune_grid,
+    trControl = ctrl
+)
+
+plot(model)
+```
+
+```{r, eval=FALSE}
+set.seed(1234)
+
+tune_grid <- expand.grid(
+    nrounds = 300 ,
+    max_depth = 2,
+    colsample_bytree = seq(0.2, 1, 0.2),
+    eta = seq(0.05, 0.3, 0.05),
+    # gamma = seq(0, 0.5, 0.1),
+    # min_child_weight = seq(0, 10, 2),
+    # subsample = seq(0.5, 1, 0.1)
+    gamma = 0.1,
+    min_child_weight = 5,
+    subsample = 0.5
+)
+
+# Train the model
+model <- train(y=train_data_smote$Survival, x=train_data_smote[, !colnames(train_data_smote) %in% "Survival"],
+    method = "xgbTree",
+    metric = "ROC",
+    tuneGrid = tune_grid,
+    trControl = ctrl
+)
+
+plot(model)
+
+```
+
+```{r, eval=FALSE}
+set.seed(1234)
+
+tune_grid <- expand.grid(
+    nrounds = 300 ,
+    max_depth = 2,
+    colsample_bytree = 0.4,
+    eta = 0.1,
+    gamma = seq(0, 0.5, 0.1),
+    min_child_weight = seq(0, 10, 2),
+    # subsample = seq(0.5, 1, 0.1)
+    subsample = 0.5
+)
+
+# Train the model
+model <- train(y=train_data_smote$Survival, x=train_data_smote[, !colnames(train_data_smote) %in% "Survival"],
+    method = "xgbTree",
+    metric = "ROC",
+    tuneGrid = tune_grid,
+    trControl = ctrl
+)
+
+plot(model)
+
+```
+
+```{r, eval=FALSE}
+set.seed(1234)
+
+tune_grid <- expand.grid(
+    nrounds = 300 ,
+    max_depth = 2,
+    colsample_bytree = 0.4,
+    eta = 0.1,
+    gamma = 0.3,
+    min_child_weight = 0,
+    subsample = seq(0.5, 1, 0.1)
+)
+
+# Train the model
+model.xgb <- train(y=train_data_smote$Survival, x=train_data_smote[, !colnames(train_data_smote) %in% "Survival"],
+    method = "xgbTree",
+    metric = "ROC",
+    tuneGrid = tune_grid,
+    trControl = ctrl
+)
+
+saveRDS(model.xgb, "../../RDSs/paper/modelos_predictivos/model_Survival_xgb_10cv10rep_maaslin.RDS")
+```
+
+```{r}
+model.xgb <- readRDS("../../RDSs/paper/modelos_predictivos/model_Survival_xgb_10cv10rep_maaslin.RDS")
+
+resample <- model.xgb$resample
+resample$algoritmo <- "xgb"
+
+if (nrow(resamples_train) == 0){
+    
+    resamples_train <- resample
+    
+} else {
+    resamples_train <- rbind(resamples_train, resample)
+    
+}
+```
+
+```{r}
+plot(model.xgb)
+model.xgb$bestTune
+```
+
+```{r}
+p1 <- ggplot(data = resamples_train, aes(y = Accuracy, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1,color = "#8B1A1A") +
+    geom_jitter(aes(y = Accuracy, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Accuracy",
+       x = "Accuracy", y = "") +
+    theme(legend.position = "none")
+ 
+p2 <- ggplot(data = resamples_train, aes(y = Kappa, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1, color = "#8B1A1A") +
+    geom_jitter(aes(y = Kappa, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Kappa",
+       x = "Kappa", y = "") +
+    theme(legend.position = "none")
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+#### SVM linear
+
+```{r, eval=FALSE}
+set.seed(1234)
+
+mygrid <- expand.grid(C = c(0.01, 0.1, 1, 10))
+
+model.svmlinear <- train(Survival~ ., data=train_data_smote, 
+               method = "svmLinear",
+               metric = "ROC",
+               trControl = ctrl,
+               tuneGrid = mygrid
+               )
+
+saveRDS(model.svmlinear, "../../RDSs/paper/modelos_predictivos/model_Survival_svml_10cv10rep_maaslin.RDS")
+```
+
+```{r}
+model.svmlinear <- readRDS("../../RDSs/paper/modelos_predictivos/model_Survival_svml_10cv10rep_maaslin.RDS")
+
+resample <- model.svmlinear$resample
+resample$algoritmo <- "svm lineal"
+
+if (nrow(resamples_train) == 0){
+    
+    resamples_train <- resample
+    
+} else {
+    resamples_train <- rbind(resamples_train, resample)
+    
+}
+```
+
+```{r}
+plot(model.svmlinear)
+model.svmlinear$bestTune
+```
+
+
+```{r}
+p1 <- ggplot(data = resamples_train, aes(y = Accuracy, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1,color = "#8B1A1A") +
+    geom_jitter(aes(y = Accuracy, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Accuracy",
+       x = "Accuracy", y = "") +
+    theme(legend.position = "none")
+ 
+p2 <- ggplot(data = resamples_train, aes(y = Kappa, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1, color = "#8B1A1A") +
+    geom_jitter(aes(y = Kappa, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Kappa",
+       x = "Kappa", y = "") +
+    theme(legend.position = "none")
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+#### SVM Radial
+
+```{r, eval=FALSE}
+set.seed(1234)
+
+mygrid <- expand.grid(C = c(0.001, 0.01, 0.1, 1, 10), sigma = c(0.001, 0.01, 0.1, 1, 10))
+
+model.svmradial<- train(Survival~ ., data=train_data_smote, 
+               method = "svmRadial",
+               metric = "ROC",
+               trControl = ctrl,
+               tuneGrid = mygrid
+               )
+
+saveRDS(model.svmradial, "../../RDSs/paper/modelos_predictivos/model_Survival_svmr_10cv10rep_maaslin.RDS")
+```
+
+```{r}
+model.svmradial <- readRDS("../../RDSs/paper/modelos_predictivos/model_Survival_svmr_10cv10rep_maaslin.RDS")
+
+resample <- model.svmradial$resample
+resample$algoritmo <- "svm radial"
+
+if (nrow(resamples_train) == 0){
+    
+    resamples_train <- resample
+    
+} else {
+    resamples_train <- rbind(resamples_train, resample)
+    
+}
+```
+
+```{r}
+plot(model.svmradial)
+model.svmradial$bestTune
+```
+
+
+```{r}
+p1 <- ggplot(data = resamples_train, aes(y = Accuracy, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1,color = "#8B1A1A") +
+    geom_jitter(aes(y = Accuracy, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Accuracy",
+       x = "Accuracy", y = "") +
+    theme(legend.position = "none")
+ 
+p2 <- ggplot(data = resamples_train, aes(y = Kappa, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1, color = "#8B1A1A") +
+    geom_jitter(aes(y = Kappa, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Kappa",
+       x = "Kappa", y = "") +
+    theme(legend.position = "none")
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+#### SVM Polinomial
+
+```{r}
+modelLookup(("svmPoly"))
+```
+
+
+```{r,eval=FALSE}
+set.seed(1234)
+
+mygrid <- expand.grid(C = c(0.001, 0.01, 0.1, 1, 10), 
+                      degree = seq(2, 4, 1),
+                      scale = seq(0.001, 0.05, 0.01))
+
+model.svmpoly<- train(Survival~ ., data=train_data_smote, 
+               method = "svmPoly",
+               metric = "ROC",
+               trControl = ctrl,
+               tuneGrid = mygrid
+               )
+
+saveRDS(model.svmpoly, "../../RDSs/paper/modelos_predictivos/model_Survival_svmp_10cv10rep_maaslin.RDS")
+```
+
+```{r}
+model.svmpoly <- readRDS("../../RDSs/paper/modelos_predictivos/model_Survival_svmp_10cv10rep_maaslin.RDS")
+
+resample <- model.svmpoly$resample
+resample$algoritmo <- "svm polinomial"
+
+if (nrow(resamples_train) == 0){
+    
+    resamples_train <- resample
+    
+} else {
+    resamples_train <- rbind(resamples_train, resample)
+    
+}
+```
+
+```{r}
+plot(model.svmpoly)
+model.svmpoly$bestTune
+```
+
+
+```{r}
+p1 <- ggplot(data = resamples_train, aes(y = Accuracy, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1,color = "#8B1A1A") +
+    geom_jitter(aes(y = Accuracy, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Accuracy",
+       x = "Accuracy", y = "") +
+    theme(legend.position = "none")
+ 
+p2 <- ggplot(data = resamples_train, aes(y = Kappa, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1, color = "#8B1A1A") +
+    geom_jitter(aes(y = Kappa, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Kappa",
+       x = "Kappa", y = "") +
+    theme(legend.position = "none")
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+#### MLP
+
+```{r}
+modelLookup("mlpWeightDecay")
+```
+
+```{r, eval=FALSE}
+set.seed(1234)
+
+mygrid <- expand.grid(size = seq(1, 10, 1), 
+                      decay = c(0.0001, 0.001, 0.01, 0.1, 1))
+
+model.mlp<- train(Survival~ ., data=train_data_smote, 
+               method = "mlpWeightDecay",
+               metric = "ROC",
+               trControl = ctrl,
+               tuneGrid = mygrid
+               )
+
+saveRDS(model.mlp, "../../RDSs/paper/modelos_predictivos/model_Survival_mlp_10cv10rep_maaslin.RDS")
+```
+
+```{r}
+model.mlp <- readRDS("../../RDSs/paper/modelos_predictivos/model_Survival_mlp_10cv10rep_maaslin.RDS")
+
+resample <- model.mlp$resample
+resample$algoritmo <- "mlpWeightDecay"
+
+if (nrow(resamples_train) == 0){
+    
+    resamples_train <- resample
+     
+} else {
+    resamples_train <- rbind(resamples_train, resample)
+    
+}
+```
+
+```{r}
+plot(model.mlp)
+model.mlp$bestTune
+```
+
+
+```{r}
+p1 <- ggplot(data = resamples_train, aes(y = Accuracy, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1,color = "#8B1A1A") +
+    geom_jitter(aes(y = Accuracy, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Accuracy",
+       x = "Accuracy", y = "") +
+    theme(legend.position = "none")
+ 
+p2 <- ggplot(data = resamples_train, aes(y = Kappa, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1, color = "#8B1A1A") +
+    geom_jitter(aes(y = Kappa, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Kappa",
+       x = "Kappa", y = "") +
+    theme(legend.position = "none")
+
+grid.arrange(p1, p2, ncol = 1)
+```
+
+```{r, fig.width=5, fig.height=5}
+orden_algoritmos <- c("GLM", "Naïve Bayes", "k-NN", "RF", "XGBoost", "SVM Lineal", "SVM Radial", "SVM Polinomial", "MLP")
+
+nombres_equivalentes <- c("glm" = "GLM",
+                          "naive-bayes" = "Naïve Bayes",
+                          "kknn" = "k-NN",
+                          "rf" = "RF",
+                          "xgb" = "XGBoost",
+                          "svm lineal" = "SVM Lineal",
+                          "svm radial" = "SVM Radial",
+                            "svm polinomial" = "SVM Polinomial",
+                          "mlpWeightDecay" = "MLP")
+
+resamples_train <- resamples_train %>%
+    mutate(algoritmo = recode(algoritmo, !!!nombres_equivalentes)) %>%
+    mutate(algoritmo = factor(algoritmo, levels = orden_algoritmos)) %>%
+    arrange(algoritmo)
+
+
+p1 <- ggplot(data = resamples_train, aes(y = Accuracy, x = algoritmo, fill = algoritmo)) +
+    geom_boxplot(fill = "#8B1A1A",alpha = 0.5) +
+    theme_minimal() +
+    labs(
+        title = "",
+        x = "", 
+        y = "Accuracy"
+        ) +
+    theme(
+        legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, face = "bold", size = 10)
+        ) +
+    ylim(c(0,1))
+ 
+# p2 <- ggplot(data = resamples_train, aes(y = Kappa, x = algoritmo, fill = algoritmo)) +
+#   geom_boxplot(size = 1, color = "#8B1A1A") +
+#     geom_jitter(aes(y = Kappa, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+#   theme_minimal() +
+#   labs(title = "Kappa",
+#        x = "Kappa", y = "") +
+#     theme(legend.position = "none")
+# 
+# grid.arrange(p1, p2, ncol = 1)
+
+p1
+```
+
+#### Prediction
+
+```{r}
+probs_glm <- predict(model.glm, testSet, type = "prob")[, 2]
+
+probs_nb <- predict(model.nb, testSet, type = "prob")[, 2]
+
+probs_kknn<- predict(model.kknn, testSet, type = "prob")[, 2]
+
+probs_rf<- predict(modelos_rf$`500`, testSet, type = "prob")[, 2]
+
+probs_xgb <- predict(model.xgb, testSet, type = "prob")[, 2]
+
+probs_svmlinear<- predict(model.svmlinear, testSet, type = "prob")[, 2]
+
+probs_svmpoly<- predict(model.svmpoly, testSet, type = "prob")[, 2]
+
+probs_svmradial<- predict(model.svmradial, testSet, type = "prob")[, 2]
+
+probs_mlp<- predict(model.mlp, testSet, type = "prob")[, 2]
+```
+
+```{r}
+library(pROC)
+
+# Calcula las curvas ROC para cada modelo
+roc_glm <- roc(testSet$Survival, probs_glm, levels = rev(levels(testSet$Survival)))
+roc_nb <- roc(testSet$Survival, probs_nb, levels = rev(levels(testSet$Survival)))
+roc_kknn <- roc(testSet$Survival, probs_kknn, levels = rev(levels(testSet$Survival)))
+roc_rf <- roc(testSet$Survival, probs_rf, levels = rev(levels(testSet$Survival)))
+roc_xgb <- roc(testSet$Survival, probs_xgb, levels = rev(levels(testSet$Survival)))
+roc_svmlinear <- roc(testSet$Survival, probs_svmlinear, levels = rev(levels(testSet$Survival)))
+roc_svmpoly <- roc(testSet$Survival, probs_svmpoly, levels = rev(levels(testSet$Survival)))
+roc_svmradial <- roc(testSet$Survival, probs_svmradial, levels = rev(levels(testSet$Survival)))
+roc_mlp <- roc(testSet$Survival, probs_mlp, levels = rev(levels(testSet$Survival)))
+```
+
+```{r}
+auc_values_survival <- c(
+  GLM = auc(roc_glm),
+  Naive_Bayes = auc(roc_nb),
+  kNN = auc(roc_kknn),
+  Random_Forest = auc(roc_rf),
+  XGBoost = auc(roc_xgb),
+  SVM_Linear = auc(roc_svmlinear),
+  SVM_Poly = auc(roc_svmpoly),
+  SVM_Radial = auc(roc_svmradial),
+  MLP = auc(roc_mlp)
+)
+
+# Mostrar los AUC
+print("AUC de los modelos:")
+print(sort(auc_values_survival, decreasing = TRUE))
+```
+
+```{r, fig.width=10, fig.height=8}
+# Crear una lista con las curvas ROC
+roc_list <- list(
+  GLM = roc_glm,
+  "Naive Bayes" = roc_nb,
+  kNN = roc_kknn,
+  "Random Forest" = roc_rf,
+  XGBoost = roc_xgb,
+  "SVM Linear" = roc_svmlinear,
+  "SVM Polynomial" = roc_svmpoly,
+  "SVM Radial" = roc_svmradial,
+  MLP = roc_mlp
+)
+
+model_labels <- paste0(names(auc_values_survival), " (AUC=", round(auc_values_survival, 2), ")")
+
+roc_list_a <- roc_list[!names(roc_list) %in% c("Random Forest", "XGBoost")]
+model_labels_a <- model_labels[!model_labels %in% c("Random_Forest (AUC=0.96)", "XGBoost (AUC=0.95)")]
+
+colores <- c("grey80", "#C71000FF",  "#008EA0FF", 
+             #"#FF6348F0",  "#5A9599FF", 
+             "#8A4198FF", "#84D7E1FF", "#FF95A8FF", "#3D3B25FF")
+
+# Convertir las curvas en un formato adecuado para ggroc
+aucs_survival <- ggroc(roc_list_a) +
+    geom_line(size = 2) + 
+    geom_abline(slope = 1, intercept = 1, linetype = "dashed", color = "gray") +
+    scale_color_manual(values = colores,
+                       labels = model_labels_a ) +
+      theme_minimal() +
+      labs(
+        x = "1 - Specificity",
+        y = "Sensitivity",
+        color = "Model"
+      ) +
+    theme(
+        text = element_text(size = 20),
+        legend.position = "bottom",
+        legend.title = element_blank(),
+        legend.text = element_text(size = 14)
+    ) +
+    guides(
+        color = guide_legend(
+        ncol = 3,
+        override.aes = list(size = 10)  
+        )
+    )
+
+
+
+aucs_survival
+```
+
+```{r, fig.width=8, fig.height=6}
+roc_list_b <- roc_list[names(roc_list) %in% c("Random Forest", "XGBoost")]
+model_labels_b <- model_labels[model_labels %in% c("Random_Forest (AUC=0.96)", "XGBoost (AUC=0.95)")]
+
+colores <- c(#"grey80", "#C71000FF",  "#008EA0FF", 
+             "#FF6348F0",  "#5A9599FF"
+             #"#8A4198FF", "#84D7E1FF", "#FF95A8FF", "#3D3B25FF"
+             )
+
+aucs_survival <- ggroc(roc_list_b) +
+    geom_line(size = 2) + 
+    geom_abline(slope = 1, intercept = 1, linetype = "dashed", color = "gray") +
+    scale_color_manual(values = colores,
+                       labels = model_labels_b ) +
+      theme_minimal() +
+      labs(
+        x = "1 - Specificity",
+        y = "Sensitivity",
+        color = "Model"
+      ) +
+    theme(
+        text = element_text(size = 20),
+        legend.position = "bottom",
+        legend.title = element_blank(),
+        legend.text = element_text(size = 14)
+    ) +
+    guides(
+        color = guide_legend(
+        ncol = 3,
+        override.aes = list(size = 10)  
+        )
+    )
+
+aucs_survival
+```
+
+
+```{r}
+set.seed(1234)
+pred_glm <- predict(model.glm, testSet)
+
+pred_nb <- predict(model.nb, testSet)
+
+pred_kknn<- predict(model.kknn, testSet)
+
+pred_rf<- predict(modelos_rf$`500`, testSet)
+
+pred_xgb <- predict(model.xgb, testSet)
+
+pred_svmlinear<- predict(model.svmlinear, testSet)
+
+pred_svmpoly<- predict(model.svmpoly, testSet)
+
+pred_svmradial<- predict(model.svmradial, testSet)
+
+pred_mlp<- predict(model.mlp, testSet)
+
+
+```
+
+```{r, fig.width=10, fig.height=11}
+conf_list <- list(
+    GLM = pred_glm,
+    "Naive Bayes" = pred_nb,
+    kNN = pred_kknn,
+    "Random Forest" = pred_rf,
+    XGBoost = pred_xgb,
+    "SVM Linear" = pred_svmlinear,
+    "SVM Polynomial" = pred_svmpoly,
+    "SVM Radial" = pred_svmradial,
+    MLP = pred_mlp
+)
+
+plots <- list()
+
+for (i in names(conf_list)){
+    conf_matrix <- confusionMatrix(conf_list[[i]], testSet$Survival)
+    
+    
+    cm_df <- as.data.frame(conf_matrix$table)
+    cm_df$match <- ifelse(cm_df$Prediction == cm_df$Reference, cm_df$Freq, -cm_df$Freq)  
+    p <- ggplot(cm_df, aes(x = factor(Prediction, levels = c("NO", "YES")),  
+                            y = factor(Reference, levels = c("YES", "NO")),  
+                            fill = match)) +  
+        geom_tile() +  
+        geom_text(aes(label = Freq), color = "black", size = 4) +
+        scale_fill_gradient2(low = "#CD3333", mid = "white", high = "darkseagreen1", 
+                             midpoint = 0) +  # 0 es el punto medio entre errores/aciertos
+        labs(
+            title = i, 
+            subtitle = paste0("Balanced Accuracy: ", round(conf_matrix$byClass[["Balanced Accuracy"]], 2),
+                              "\nF1-score: ", round(conf_matrix$byClass[["F1"]], 2),
+                              "     Specifity: ", round(conf_matrix$byClass[["Specificity"]], 2)),
+            x = "Predict", 
+            y = "Real"
+        ) +
+        theme_minimal() + 
+        theme(
+            legend.position = "none",
+            plot.margin = margin(20,20,20,20)
+        )
+
+    
+    plots[[i]] <- p
+    
+}
+
+cowplot::plot_grid(plotlist = plots)
+    
+cowplot::plot_grid(plotlist = plots[!names(plots) %in% c("Random Forest", "XGBoost")])
+
+```
+
+```{r, fig.width=8, fig.height=4}
+cowplot::plot_grid(plotlist = plots[names(plots) %in% c("Random Forest", "XGBoost")])
+```
+
+
+## AHT
+
+```{r}
+df_genus_prevalente <- assay(tse_prevalente, "relabundance")
+
+taxones <- dda_maaslin_prevalente$AHT |> 
+    dplyr::filter(pval < 0.05) |>
+    pull(feature)
+
+# Añadir la variables de salida
+df_genus_prevalente <- df_genus_prevalente |> 
+    t()|> 
+    as.data.frame() |>
+    dplyr::select(all_of(taxones))
+
+df_genus_prevalente$AHT <- colData(tse_prevalente)$AHT
+```
+
+### Data partition
+
+```{r}
+set.seed(1234)
+
+train.Idx.80<- createDataPartition(df_genus_prevalente$AHT,
+                                       p=0.7, #Genera un 80% para train, 20% para test
+                                       list = FALSE, # resultados en una matriz
+                                       times = 1) #Genera solamente una partición 80/20
+
+trainSet<- df_genus_prevalente[train.Idx.80, ]
+testSet <- df_genus_prevalente[-train.Idx.80, ]
+
+table(trainSet$AHT)
+table(testSet$AHT)
+```
+
+### SMOTE
+
+```{r}
+set.seed(1234)
+smote_result <- SMOTE(X = trainSet[, -which(names(trainSet) == "AHT")], # Variables predictoras
+                      target = trainSet$AHT,                             # Variable de salida
+                      K = 5,                                             # Vecinos más cercanos
+                      dup_size = 2)  
+
+train_data_smote <- smote_result$data
+names(train_data_smote)[ncol(train_data_smote)] <- "AHT" # Renombrar la columna de salida
+train_data_smote$AHT <- as.factor(train_data_smote$AHT) 
+
+table(train_data_smote$AHT)
+
+```
+
+### Modelos entrenamientos
+
+```{r}
+resamples_train <- data.frame()
+```
+
+#### GLM
+
+```{r,eval=FALSE}
+set.seed(1234)
+model.glm <- train(AHT ~ ., data = train_data_smote, 
+               method = "glm", 
+               family = "binomial",                    # Especificar regresión logística
+               metric = "ROC",                         # Optimizar usando el área bajo la curva ROC
+               trControl = ctrl)
+
+saveRDS(model.glm, "../../RDSs/paper/modelos_predictivos/model_AHT_glm_10cv10rep_maaslin.RDS")
+```
+
+```{r}
+model.glm <- readRDS("../../RDSs/paper/modelos_predictivos/model_AHT_glm_10cv10rep_maaslin.RDS")
+
+resample <- model.glm$resample
+resample$algoritmo <- "glm"
+
+if (nrow(resamples_train) == 0){
+    
+    resamples_train <- resample
+    
+} else {
+    resamples_train <- rbind(resamples_train, resample)
+    
+}
+
+```
+
+#### Naive bayes
+
+```{r}
+modelLookup("naive_bayes")
+```
+
+```{r,eval=FALSE}
+set.seed(1234)
+
+mygrid <- expand.grid(laplace = seq(0, 1, 0.2),
+                      usekernel = c(T, F),
+                      adjust = seq(0.2, 2.2, 0.4))
+
+model.nb <- train(AHT ~ ., data = train_data_smote, 
+               method = "naive_bayes",
+               metric = "ROC",
+               trControl = ctrl,
+               tuneGrid=mygrid
+               )
+
+saveRDS(model.nb, "../../RDSs/paper/modelos_predictivos/model_AHT_nb_10cv10rep_maaslin.RDS")
+```
+
+```{r}
+model.nb <- readRDS("../../RDSs/paper/modelos_predictivos/model_AHT_nb_10cv10rep_maaslin.RDS")
+
+resample <- model.nb$resample
+resample$algoritmo <- "naive-bayes"
+
+if (nrow(resamples_train) == 0){
+    
+    resamples_train <- resample
+    
+} else {
+    resamples_train <- rbind(resamples_train, resample)
+    
+}
+```
+
+```{r}
+plot(model.nb)
+model.nb$bestTune
+```
+
+
+```{r}
+p1 <- ggplot(data = resamples_train, aes(y = Accuracy, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1,color = "#8B1A1A") +
+    geom_jitter(aes(y = Accuracy, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Accuracy",
+       x = "Accuracy", y = "") +
+    theme(legend.position = "none")
+ 
+p2 <- ggplot(data = resamples_train, aes(y = Kappa, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1, color = "#8B1A1A") +
+    geom_jitter(aes(y = Kappa, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Kappa",
+       x = "Kappa", y = "") +
+    theme(legend.position = "none")
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+#### kknn
+
+```{r}
+modelLookup("kknn")
+```
+
+
+```{r,eval=FALSE}
+set.seed(1234)
+
+mygrid <- expand.grid(kmax = seq(5,9,2),
+                      distance = c(1,2,3),
+                      kernel = c("rectangular","triangular",
+                                 "optimal" 
+                                  ,"epanechnikov", "biweight", "triweight" 
+                                  ,"cos", "inv", "gaussian","rank"
+                                ))
+
+model.kknn <- train(y=train_data_smote$AHT, x=train_data_smote[, !colnames(train_data_smote) %in% "AHT"], 
+               method = "kknn",
+               metric = "ROC",
+               trControl = ctrl,
+               tuneGrid = mygrid
+               )
+
+saveRDS(model.kknn, "../../RDSs/paper/modelos_predictivos/model_AHT_kknn_10cv10rep_maaslin.RDS")
+```
+
+```{r}
+model.kknn <- readRDS("../../RDSs/paper/modelos_predictivos/model_AHT_kknn_10cv10rep_maaslin.RDS")
+
+resample <- model.kknn$resample
+resample$algoritmo <- "kknn"
+
+if (nrow(resamples_train) == 0){
+    
+    resamples_train <- resample
+    
+} else {
+    resamples_train <- rbind(resamples_train, resample)
+    
+}
+```
+
+```{r}
+plot(model.kknn)
+model.kknn$bestTune
+```
+
+
+```{r}
+p1 <- ggplot(data = resamples_train, aes(y = Accuracy, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1,color = "#8B1A1A") +
+    geom_jitter(aes(y = Accuracy, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Accuracy",
+       x = "Accuracy", y = "") +
+    theme(legend.position = "none")
+ 
+p2 <- ggplot(data = resamples_train, aes(y = Kappa, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1, color = "#8B1A1A") +
+    geom_jitter(aes(y = Kappa, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Kappa",
+       x = "Kappa", y = "") +
+    theme(legend.position = "none")
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+
+#### random forest
+
+```{r}
+modelLookup("rf")
+```
+
+
+```{r,eval=FALSE}
+set.seed(1234)
+
+mygrid <- expand.grid(mtry = c(2:round(sqrt(ncol(train_data_smote)))),
+                      splitrule = c("gini", "extratrees"),
+                      min.node.size = 1)
+
+trees <- seq(500, 2000, 500) 
+
+modelos_rf <- list() # lista vacia para meter los resultados de cada bucle
+for (tree in trees){ # bucle en cada pasada hace un modelo con un número de arboles distintos
+  modelo <- train(AHT~.,data=train_data_smote,
+                  method="ranger",
+                  tuneGrid=mygrid,
+                  trControl=ctrl, 
+                  ntree = tree
+  )
+  modelos_rf[[paste(tree)]] <- modelo # metemos el modelo en la lista
+}
+
+saveRDS(modelos_rf, "../../RDSs/paper/modelos_predictivos/model_AHT_rf_10cv10rep_maaslin.RDS")
+```
+
+```{r, fig.width=8, fig.height= 5}
+modelos_rf <- readRDS("../../RDSs/paper/modelos_predictivos/model_AHT_rf_10cv10rep_maaslin.RDS")
+
+datos_combinados <- data.frame()
+for (i in names(modelos_rf)){
+    
+    if (nrow(datos_combinados) == 0 ){
+        
+       datos_combinados <- data.frame(mtry = modelos_rf[[i]]$results$mtry, 
+                                      splitrule = modelos_rf[[i]]$results$splitrule, 
+                                      MetricValue = modelos_rf[[i]]$results$Accuracy, 
+                                      Trees = i, 
+                                      Metric = "Accuracy")
+        
+    } else {
+        
+        tmp <- data.frame(mtry = modelos_rf[[i]]$results$mtry, 
+                          splitrule = modelos_rf[[i]]$results$splitrule, 
+                          MetricValue = modelos_rf[[i]]$results$Accuracy, 
+                          Trees = i, 
+                          Metric = "Accuracy")
+        
+        datos_combinados <- rbind(datos_combinados, tmp)
+        
+    }
+}
+
+#datos_combinados$Trees <- factor(datos_combinados$Trees, levels = c("500 trees", "1000 trees", "1500 trees", "2000 trees"))
+
+datos_combinados %>%
+    # filter(splitrule == "extratrees") %>%
+    filter(Metric == "Accuracy") %>%
+    ggplot(aes(x = mtry, y = MetricValue, color = Trees)) +
+    geom_point(size = 4) +
+    #scale_color_manual(values = c("#C19A6B", "#A3C9A8", "#5B9279", "#264E36")) +
+    geom_line(linetype = "dashed") +
+    theme_minimal() +
+    labs(x = "Mtry", y = "Accuracy", title = "train RF") +
+    facet_wrap(~ splitrule)
+ 
+```
+
+```{r, fig.width=8, fig.height= 5}
+datos_combinados <- data.frame()
+for (i in names(modelos_rf)){
+    
+    if (nrow(datos_combinados) == 0 ){
+        
+       datos_combinados <- data.frame(mtry = modelos_rf[[i]]$results$mtry, 
+                                      splitrule = modelos_rf[[i]]$results$splitrule, 
+                                      MetricValue = modelos_rf[[i]]$results$Kappa, 
+                                      Trees = i, 
+                                      Metric = "Kappa")
+        
+    } else {
+        
+        tmp <- data.frame(mtry = modelos_rf[[i]]$results$mtry, 
+                          splitrule = modelos_rf[[i]]$results$splitrule, 
+                          MetricValue = modelos_rf[[i]]$results$Kappa, 
+                          Trees = i, 
+                          Metric = "Kappa")
+        
+        datos_combinados <- rbind(datos_combinados, tmp)
+        
+    }
+}
+
+#datos_combinados$Trees <- factor(datos_combinados$Trees, levels = c("500 trees", "1000 trees", "1500 trees", "2000 trees"))
+
+datos_combinados %>%
+    # filter(splitrule == "extratrees") %>%
+    filter(Metric == "Kappa") %>%
+    ggplot(aes(x = mtry, y = MetricValue, color = Trees)) +
+    geom_point(size = 4) +
+    #scale_color_manual(values = c("#C19A6B", "#A3C9A8", "#5B9279", "#264E36")) +
+    geom_line(linetype = "dashed") +
+    theme_minimal() +
+    labs(x = "Mtry", y = "Accuracy", title = "train RF") +
+    facet_wrap(~ splitrule)
+ 
+```
+
+```{r}
+
+resample <- modelos_rf$'1000'$resample
+resample$algoritmo <- "rf"
+
+if (nrow(resamples_train) == 0){
+    
+    resamples_train <- resample
+    
+} else {
+    resamples_train <- rbind(resamples_train, resample)
+    
+}
+```
+
+```{r}
+plot(modelos_rf$'1000')
+modelos_rf$'1000'$bestTune
+```
+
+
+```{r}
+p1 <- ggplot(data = resamples_train, aes(y = Accuracy, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1,color = "#8B1A1A") +
+    geom_jitter(aes(y = Accuracy, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Accuracy",
+       x = "Accuracy", y = "") +
+    theme(legend.position = "none")
+ 
+p2 <- ggplot(data = resamples_train, aes(y = Kappa, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1, color = "#8B1A1A") +
+    geom_jitter(aes(y = Kappa, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Kappa",
+       x = "Kappa", y = "") +
+    theme(legend.position = "none")
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+#### XGboost
+
+```{r}
+modelLookup("xgbTree")
+```
+
+
+```{r,eval=FALSE}
+set.seed(1234)
+
+tune_grid <- expand.grid(
+    nrounds = seq(50, 300, 50) ,
+    max_depth = seq(2, 10, 4) ,
+    # colsample_bytree = seq(0.2, 1, 0.2),
+    # eta = seq(0.05, 0.3, 0.05),
+    # gamma = seq(0, 0.5, 0.1),
+    # min_child_weight = seq(0, 10, 2),
+    # subsample = seq(0.5, 1, 0.1)
+    colsample_bytree = 0.5,
+    eta = 0.15,
+    gamma = 0.1,
+    min_child_weight = 5,
+    subsample = 0.5
+)
+
+# Train the model
+model <- train(y=train_data_smote$AHT, x=train_data_smote[, !colnames(train_data_smote) %in% "AHT"],
+    method = "xgbTree",
+    metric = "ROC",
+    tuneGrid = tune_grid,
+    trControl = ctrl
+)
+
+plot(model)
+```
+
+```{r,eval=FALSE}
+set.seed(1234)
+
+tune_grid <- expand.grid(
+    nrounds = 300 ,
+    max_depth = 10 ,
+    colsample_bytree = seq(0.2, 1, 0.2),
+    eta = seq(0.05, 0.3, 0.05),
+    # gamma = seq(0, 0.5, 0.1),
+    # min_child_weight = seq(0, 10, 2),
+    # subsample = seq(0.5, 1, 0.1)
+    gamma = 0.1,
+    min_child_weight = 5,
+    subsample = 0.5
+)
+
+# Train the model
+model <- train(y=train_data_smote$AHT, x=train_data_smote[, !colnames(train_data_smote) %in% "AHT"],
+    method = "xgbTree",
+    metric = "ROC",
+    tuneGrid = tune_grid,
+    trControl = ctrl
+)
+
+plot(model)
+
+```
+
+```{r,eval=FALSE}
+set.seed(1234)
+
+tune_grid <- expand.grid(
+    nrounds = 300 ,
+    max_depth = 10 ,
+    colsample_bytree = 0.8,
+    eta = 0.3,
+    gamma = seq(0, 0.5, 0.1),
+    min_child_weight = seq(0, 10, 2),
+    # subsample = seq(0.5, 1, 0.1)
+    subsample = 0.5
+)
+
+# Train the model
+model <- train(y=train_data_smote$AHT, x=train_data_smote[, !colnames(train_data_smote) %in% "AHT"],
+    method = "xgbTree",
+    metric = "ROC",
+    tuneGrid = tune_grid,
+    trControl = ctrl
+)
+
+plot(model)
+
+```
+
+```{r,eval=FALSE}
+set.seed(1234)
+
+tune_grid <- expand.grid(
+    nrounds = 300 ,
+    max_depth = 10 ,
+    colsample_bytree = 0.8,
+    eta = 0.3,
+    gamma = 0.2,
+    min_child_weight = 0,
+    subsample = seq(0.5, 1, 0.1)
+)
+
+# Train the model
+model.xgb <- train(y=train_data_smote$AHT, x=train_data_smote[, !colnames(train_data_smote) %in% "AHT"],
+    method = "xgbTree",
+    metric = "ROC",
+    tuneGrid = tune_grid,
+    trControl = ctrl
+)
+
+saveRDS(model.xgb, "../../RDSs/paper/modelos_predictivos/model_AHT_xgb_10cv10rep_maaslin.RDS")
+```
+
+```{r}
+model.xgb <- readRDS("../../RDSs/paper/modelos_predictivos/model_AHT_xgb_10cv10rep_maaslin.RDS")
+resample <- model.xgb$resample
+resample$algoritmo <- "xgb"
+
+if (nrow(resamples_train) == 0){
+    
+    resamples_train <- resample
+    
+} else {
+    resamples_train <- rbind(resamples_train, resample)
+    
+}
+```
+
+```{r}
+plot(model.xgb)
+model.xgb$bestTune
+model.xgb$resample
+```
+
+```{r}
+p1 <- ggplot(data = resamples_train, aes(y = Accuracy, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1,color = "#8B1A1A") +
+    geom_jitter(aes(y = Accuracy, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Accuracy",
+       x = "Accuracy", y = "") +
+    theme(legend.position = "none")
+ 
+p2 <- ggplot(data = resamples_train, aes(y = Kappa, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1, color = "#8B1A1A") +
+    geom_jitter(aes(y = Kappa, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Kappa",
+       x = "Kappa", y = "") +
+    theme(legend.position = "none")
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+#### SVM linear
+
+```{r,eval=FALSE}
+set.seed(1234)
+
+mygrid <- expand.grid(C = c(0.01, 0.1, 1, 10))
+
+model.svmlinear <- train(AHT~ ., data=train_data_smote, 
+               method = "svmLinear",
+               metric = "ROC",
+               trControl = ctrl,
+               tuneGrid = mygrid
+               )
+
+saveRDS(model.svmlinear, "../../RDSs/paper/modelos_predictivos/model_AHT_svml_10cv10rep_maaslin.RDS")
+```
+
+```{r}
+model.svmlinear <- readRDS("../../RDSs/paper/modelos_predictivos/model_AHT_svml_10cv10rep_maaslin.RDS")
+
+resample <- model.svmlinear$resample
+resample$algoritmo <- "svm lineal"
+
+if (nrow(resamples_train) == 0){
+    
+    resamples_train <- resample
+    
+} else {
+    resamples_train <- rbind(resamples_train, resample)
+    
+}
+```
+
+```{r}
+plot(model.svmlinear)
+model.svmlinear$bestTune
+```
+
+
+```{r}
+p1 <- ggplot(data = resamples_train, aes(y = Accuracy, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1,color = "#8B1A1A") +
+    geom_jitter(aes(y = Accuracy, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Accuracy",
+       x = "Accuracy", y = "") +
+    theme(legend.position = "none")
+ 
+p2 <- ggplot(data = resamples_train, aes(y = Kappa, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1, color = "#8B1A1A") +
+    geom_jitter(aes(y = Kappa, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Kappa",
+       x = "Kappa", y = "") +
+    theme(legend.position = "none")
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+#### SVM Radial
+
+```{r,eval=FALSE}
+set.seed(1234)
+
+mygrid <- expand.grid(C = c(0.001, 0.01, 0.1, 1, 10), sigma = c(0.001, 0.01, 0.1, 1, 10))
+
+model.svmradial<- train(AHT~ ., data=train_data_smote, 
+               method = "svmRadial",
+               metric = "ROC",
+               trControl = ctrl,
+               tuneGrid = mygrid
+               )
+
+saveRDS(model.svmradial, "../../RDSs/paper/modelos_predictivos/model_AHT_svmr_10cv10rep_maaslin.RDS")
+```
+
+```{r}
+model.svmradial <- readRDS("../../RDSs/paper/modelos_predictivos/model_AHT_svmr_10cv10rep_maaslin.RDS")
+
+resample <- model.svmradial$resample
+resample$algoritmo <- "svm radial"
+
+if (nrow(resamples_train) == 0){
+    
+    resamples_train <- resample
+    
+} else {
+    resamples_train <- rbind(resamples_train, resample)
+    
+}
+```
+
+```{r}
+plot(model.svmradial)
+model.svmradial$bestTune
+```
+
+
+```{r}
+p1 <- ggplot(data = resamples_train, aes(y = Accuracy, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1,color = "#8B1A1A") +
+    geom_jitter(aes(y = Accuracy, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Accuracy",
+       x = "Accuracy", y = "") +
+    theme(legend.position = "none")
+ 
+p2 <- ggplot(data = resamples_train, aes(y = Kappa, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1, color = "#8B1A1A") +
+    geom_jitter(aes(y = Kappa, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Kappa",
+       x = "Kappa", y = "") +
+    theme(legend.position = "none")
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+#### SVM Polinomial
+
+```{r}
+modelLookup(("svmPoly"))
+```
+
+
+```{r,eval=FALSE}
+set.seed(1234)
+
+mygrid <- expand.grid(C = c(0.001, 0.01, 0.1, 1, 10), 
+                      degree = seq(2, 4, 1),
+                      scale = seq(0.001, 0.05, 0.01))
+
+model.svmpoly<- train(AHT~ ., data=train_data_smote, 
+               method = "svmPoly",
+               metric = "ROC",
+               trControl = ctrl,
+               tuneGrid = mygrid
+               )
+
+saveRDS(model.svmpoly, "../../RDSs/paper/modelos_predictivos/model_AHT_svmp_10cv10rep_maaslin.RDS")
+```
+
+```{r}
+model.svmpoly <- readRDS("../../RDSs/paper/modelos_predictivos/model_AHT_svmp_10cv10rep_maaslin.RDS")
+
+resample <- model.svmpoly$resample
+resample$algoritmo <- "svm polinomial"
+
+if (nrow(resamples_train) == 0){
+    
+    resamples_train <- resample
+    
+} else {
+    resamples_train <- rbind(resamples_train, resample)
+    
+}
+```
+
+```{r}
+plot(model.svmpoly)
+model.svmpoly$bestTune
+```
+
+
+```{r}
+p1 <- ggplot(data = resamples_train, aes(y = Accuracy, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1,color = "#8B1A1A") +
+    geom_jitter(aes(y = Accuracy, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Accuracy",
+       x = "Accuracy", y = "") +
+    theme(legend.position = "none")
+ 
+p2 <- ggplot(data = resamples_train, aes(y = Kappa, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1, color = "#8B1A1A") +
+    geom_jitter(aes(y = Kappa, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Kappa",
+       x = "Kappa", y = "") +
+    theme(legend.position = "none")
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+#### MLP
+
+```{r}
+modelLookup("mlpWeightDecay")
+```
+
+```{r, eval=FALSE}
+set.seed(1234)
+
+mygrid <- expand.grid(size = seq(1, 10, 1), 
+                      decay = c(0.0001, 0.001, 0.01, 0.1, 1))
+
+model.mlp<- train(AHT~ ., data=train_data_smote, 
+               method = "mlpWeightDecay",
+               metric = "ROC",
+               trControl = ctrl,
+               tuneGrid = mygrid
+               )
+
+saveRDS(model.mlp, "../../RDSs/paper/modelos_predictivos/model_AHT_mlp_10cv10rep_maaslin.RDS")
+```
+
+```{r}
+model.mlp <- readRDS("../../RDSs/paper/modelos_predictivos/model_AHT_mlp_10cv10rep_maaslin.RDS")
+
+resample <- model.mlp$resample
+resample$algoritmo <- "mlpWeightDecay"
+
+if (nrow(resamples_train) == 0){
+    
+    resamples_train <- resample
+     
+} else {
+    resamples_train <- rbind(resamples_train, resample)
+    
+}
+```
+
+```{r}
+plot(model.mlp)
+model.mlp$bestTune
+```
+
+
+```{r}
+p1 <- ggplot(data = resamples_train, aes(y = Accuracy, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1,color = "#8B1A1A") +
+    geom_jitter(aes(y = Accuracy, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Accuracy",
+       x = "Accuracy", y = "") +
+    theme(legend.position = "none")
+ 
+p2 <- ggplot(data = resamples_train, aes(y = Kappa, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1, color = "#8B1A1A") +
+    geom_jitter(aes(y = Kappa, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Kappa",
+       x = "Kappa", y = "") +
+    theme(legend.position = "none")
+
+grid.arrange(p1, p2, ncol = 1)
+```
+
+#### Prediction
+
+```{r}
+probs_glm <- predict(model.glm, testSet, type = "prob")[, 2]
+
+probs_nb <- predict(model.nb, testSet, type = "prob")[, 2]
+
+probs_kknn<- predict(model.kknn, testSet, type = "prob")[, 2]
+
+probs_rf<- predict(modelos_rf$`1000`, testSet, type = "prob")[, 2]
+
+probs_xgb <- predict(model.xgb, testSet, type = "prob")[, 2]
+
+probs_svmlinear<- predict(model.svmlinear, testSet, type = "prob")[, 2]
+
+probs_svmpoly<- predict(model.svmpoly, testSet, type = "prob")[, 2]
+
+probs_svmradial<- predict(model.svmradial, testSet, type = "prob")[, 2]
+
+probs_mlp<- predict(model.mlp, testSet, type = "prob")[, 2]
+```
+
+```{r}
+library(pROC)
+
+# Calcula las curvas ROC para cada modelo
+roc_glm <- roc(testSet$AHT, probs_glm, levels = rev(levels(testSet$AHT)))
+roc_nb <- roc(testSet$AHT, probs_nb, levels = rev(levels(testSet$AHT)))
+roc_kknn <- roc(testSet$AHT, probs_kknn, levels = rev(levels(testSet$AHT)))
+roc_rf <- roc(testSet$AHT, probs_rf, levels = rev(levels(testSet$AHT)))
+roc_xgb <- roc(testSet$AHT, probs_xgb, levels = rev(levels(testSet$AHT)))
+roc_svmlinear <- roc(testSet$AHT, probs_svmlinear, levels = rev(levels(testSet$AHT)))
+roc_svmpoly <- roc(testSet$AHT, probs_svmpoly, levels = rev(levels(testSet$AHT)))
+roc_svmradial <- roc(testSet$AHT, probs_svmradial, levels = rev(levels(testSet$AHT)))
+roc_mlp <- roc(testSet$AHT, probs_mlp, levels = rev(levels(testSet$AHT)))
+```
+
+```{r}
+# Crear una lista con las curvas ROC
+roc_list <- list(
+  GLM = roc_glm,
+  "Naive Bayes" = roc_nb,
+  kNN = roc_kknn,
+  "Random Forest" = roc_rf,
+  XGBoost = roc_xgb,
+  "SVM Linear" = roc_svmlinear,
+  "SVM Polynomial" = roc_svmpoly,
+  "SVM Radial" = roc_svmradial,
+  MLP = roc_mlp
+)
+
+# Convertir las curvas en un formato adecuado para ggroc
+aucs_aht <- ggroc(roc_list) +
+    geom_line(size = 0.5) + 
+    geom_abline(slope = 1, intercept = 1, linetype = "dashed", color = "gray") +
+    scale_color_manual(values = paletteer::paletteer_d("ggsci::planetexpress_futurama")) +
+      theme_minimal() +
+      labs(
+        title = "ROC Curves for Multiple Models",
+        x = "1 - Specificity",
+        y = "Sensitivity",
+        color = "Model"
+      ) +
+      theme(
+        text = element_text(size = 12)
+      )
+
+aucs_aht
+```
+
+```{r}
+auc_values_aht <- c(
+  GLM = auc(roc_glm),
+  Naive_Bayes = auc(roc_nb),
+  kNN = auc(roc_kknn),
+  Random_Forest = auc(roc_rf),
+  XGBoost = auc(roc_xgb),
+  SVM_Linear = auc(roc_svmlinear),
+  SVM_Poly = auc(roc_svmpoly),
+  SVM_Radial = auc(roc_svmradial),
+  MLP = auc(roc_mlp)
+)
+
+# Mostrar los AUC
+print("AUC de los modelos:")
+print(sort(auc_values_aht, decreasing = TRUE))
+```
+
+## Biliary_complications
+
+```{r}
+df_genus_prevalente <- assay(tse_prevalente, "relabundance")
+
+taxones <- dda_maaslin_prevalente$Biliary_complications |> 
+    dplyr::filter(pval < 0.05) |>
+    pull(feature)
+
+# Añadir la variables de salida
+df_genus_prevalente <- df_genus_prevalente |> 
+    t()|> 
+    as.data.frame() |>
+    dplyr::select(all_of(taxones))
+
+df_genus_prevalente$Biliary_complications <- colData(tse_prevalente)$Biliary_complications
+```
+
+### Data partition
+
+```{r}
+set.seed(1234)
+
+train.Idx.80<- createDataPartition(df_genus_prevalente$Biliary_complications,
+                                       p=0.7, #Genera un 80% para train, 20% para test
+                                       list = FALSE, # resultados en una matriz
+                                       times = 1) #Genera solamente una partición 80/20
+
+trainSet<- df_genus_prevalente[train.Idx.80, ]
+testSet <- df_genus_prevalente[-train.Idx.80, ]
+
+table(trainSet$Biliary_complications)
+table(testSet$Biliary_complications)
+```
+
+### SMOTE
+
+```{r}
+set.seed(1234)
+smote_result <- SMOTE(X = trainSet[, -which(names(trainSet) == "Biliary_complications")], # Variables predictoras
+                      target = trainSet$Biliary_complications,                             # Variable de salida
+                      K = 10,                                             # Vecinos más cercanos
+                      dup_size = 2)  
+
+train_data_smote <- smote_result$data
+names(train_data_smote)[ncol(train_data_smote)] <- "Biliary_complications" # Renombrar la columna de salida
+train_data_smote$Biliary_complications <- as.factor(train_data_smote$Biliary_complications) 
+
+table(train_data_smote$Biliary_complications)
+
+```
+
+### Modelos entrenamientos
+
+```{r}
+resamples_train <- data.frame()
+```
+
+#### GLM
+
+```{r, eval=FALSE}
+set.seed(1234)
+model.glm <- train(Biliary_complications ~ ., data = train_data_smote, 
+               method = "glm", 
+               family = "binomial",                    # Especificar regresión logística
+               metric = "ROC",                         # Optimizar usando el área bajo la curva ROC
+               trControl = ctrl)
+
+saveRDS(model.glm, "../../RDSs/paper/modelos_predictivos/model_Biliary_complications_glm_10cv10rep_maaslin.RDS")
+```
+
+```{r}
+model.glm <- readRDS("../../RDSs/paper/modelos_predictivos/model_Biliary_complications_glm_10cv10rep_maaslin.RDS")
+
+resample <- model.glm$resample
+resample$algoritmo <- "glm"
+
+if (nrow(resamples_train) == 0){
+    
+    resamples_train <- resample
+    
+} else {
+    resamples_train <- rbind(resamples_train, resample)
+    
+}
+
+```
+
+#### Naive bayes
+
+```{r}
+modelLookup("naive_bayes")
+```
+
+```{r,eval=FALSE}
+set.seed(1234)
+
+mygrid <- expand.grid(laplace = seq(0, 1, 0.2),
+                      usekernel = c(T, F),
+                      adjust = seq(0.2, 2.2, 0.4))
+
+model.nb <- train(Biliary_complications ~ ., data = train_data_smote, 
+               method = "naive_bayes",
+               metric = "ROC",
+               trControl = ctrl,
+               tuneGrid=mygrid
+               )
+
+saveRDS(model.nb, "../../RDSs/paper/modelos_predictivos/model_Biliary_complications_nb_10cv10rep_maaslin.RDS")
+```
+
+```{r}
+model.nb <- readRDS("../../RDSs/paper/modelos_predictivos/model_Biliary_complications_nb_10cv10rep_maaslin.RDS")
+
+resample <- model.nb$resample
+resample$algoritmo <- "naive-bayes"
+
+if (nrow(resamples_train) == 0){
+    
+    resamples_train <- resample
+    
+} else {
+    resamples_train <- rbind(resamples_train, resample)
+    
+}
+```
+
+```{r}
+plot(model.nb)
+model.nb$bestTune
+```
+
+
+```{r}
+p1 <- ggplot(data = resamples_train, aes(y = Accuracy, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1,color = "#8B1A1A") +
+    geom_jitter(aes(y = Accuracy, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Accuracy",
+       x = "Accuracy", y = "") +
+    theme(legend.position = "none")
+ 
+p2 <- ggplot(data = resamples_train, aes(y = Kappa, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1, color = "#8B1A1A") +
+    geom_jitter(aes(y = Kappa, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Kappa",
+       x = "Kappa", y = "") +
+    theme(legend.position = "none")
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+#### kknn
+
+```{r}
+modelLookup("kknn")
+```
+
+
+```{r,eval=FALSE}
+set.seed(1234)
+
+mygrid <- expand.grid(kmax = seq(5,9,2),
+                      distance = c(1,2,3),
+                      kernel = c("rectangular","triangular",
+                                 "optimal" 
+                                  ,"epanechnikov", "biweight", "triweight" 
+                                  ,"cos", "inv", "gaussian","rank"
+                                ))
+
+model.kknn <- train(y=train_data_smote$Biliary_complications, x=train_data_smote[, !colnames(train_data_smote) %in% "Biliary_complications"], 
+               method = "kknn",
+               metric = "ROC",
+               trControl = ctrl,
+               tuneGrid = mygrid
+               )
+
+saveRDS(model.kknn, "../../RDSs/paper/modelos_predictivos/model_Biliary_complications_kknn_10cv10rep_maaslin.RDS")
+```
+
+```{r}
+model.kknn <- readRDS("../../RDSs/paper/modelos_predictivos/model_Biliary_complications_kknn_10cv10rep_maaslin.RDS")
+
+resample <- model.kknn$resample
+resample$algoritmo <- "kknn"
+
+if (nrow(resamples_train) == 0){
+    
+    resamples_train <- resample
+    
+} else {
+    resamples_train <- rbind(resamples_train, resample)
+    
+}
+```
+
+```{r}
+plot(model.kknn)
+model.kknn$bestTune
+```
+
+
+```{r}
+p1 <- ggplot(data = resamples_train, aes(y = Accuracy, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1,color = "#8B1A1A") +
+    geom_jitter(aes(y = Accuracy, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Accuracy",
+       x = "Accuracy", y = "") +
+    theme(legend.position = "none")
+ 
+p2 <- ggplot(data = resamples_train, aes(y = Kappa, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1, color = "#8B1A1A") +
+    geom_jitter(aes(y = Kappa, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Kappa",
+       x = "Kappa", y = "") +
+    theme(legend.position = "none")
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+
+#### random forest
+
+```{r}
+modelLookup("rf")
+```
+
+
+```{r,eval=FALSE}
+set.seed(1234)
+
+mygrid <- expand.grid(mtry = c(2:round(sqrt(ncol(train_data_smote)))),
+                      splitrule = c("gini", "extratrees"),
+                      min.node.size = 1)
+
+trees <- seq(500, 2000, 500) 
+
+modelos_rf <- list() # lista vacia para meter los resultados de cada bucle
+for (tree in trees){ # bucle en cada pasada hace un modelo con un número de arboles distintos
+  modelo <- train(Biliary_complications~.,data=train_data_smote,
+                  method="ranger",
+                  tuneGrid=mygrid,
+                  trControl=ctrl, 
+                  ntree = tree
+  )
+  modelos_rf[[paste(tree)]] <- modelo # metemos el modelo en la lista
+}
+
+saveRDS(modelos_rf, "../../RDSs/paper/modelos_predictivos/model_Biliary_complications_rf_10cv10rep_maaslin.RDS")
+```
+
+```{r, fig.width=8, fig.height= 5}
+modelos_rf <- readRDS("../../RDSs/paper/modelos_predictivos/model_Biliary_complications_rf_10cv10rep_maaslin.RDS")
+datos_combinados <- data.frame()
+for (i in names(modelos_rf)){
+    
+    if (nrow(datos_combinados) == 0 ){
+        
+       datos_combinados <- data.frame(mtry = modelos_rf[[i]]$results$mtry, 
+                                      splitrule = modelos_rf[[i]]$results$splitrule, 
+                                      MetricValue = modelos_rf[[i]]$results$Accuracy, 
+                                      Trees = i, 
+                                      Metric = "Accuracy")
+        
+    } else {
+        
+        tmp <- data.frame(mtry = modelos_rf[[i]]$results$mtry, 
+                          splitrule = modelos_rf[[i]]$results$splitrule, 
+                          MetricValue = modelos_rf[[i]]$results$Accuracy, 
+                          Trees = i, 
+                          Metric = "Accuracy")
+        
+        datos_combinados <- rbind(datos_combinados, tmp)
+        
+    }
+}
+
+#datos_combinados$Trees <- factor(datos_combinados$Trees, levels = c("500 trees", "1000 trees", "1500 trees", "2000 trees"))
+
+datos_combinados %>%
+    # filter(splitrule == "extratrees") %>%
+    filter(Metric == "Accuracy") %>%
+    ggplot(aes(x = mtry, y = MetricValue, color = Trees)) +
+    geom_point(size = 4) +
+    #scale_color_manual(values = c("#C19A6B", "#A3C9A8", "#5B9279", "#264E36")) +
+    geom_line(linetype = "dashed") +
+    theme_minimal() +
+    labs(x = "Mtry", y = "Accuracy", title = "train RF") +
+    facet_wrap(~ splitrule)
+ 
+```
+
+```{r, fig.width=8, fig.height= 5}
+datos_combinados <- data.frame()
+for (i in names(modelos_rf)){
+    
+    if (nrow(datos_combinados) == 0 ){
+        
+       datos_combinados <- data.frame(mtry = modelos_rf[[i]]$results$mtry, 
+                                      splitrule = modelos_rf[[i]]$results$splitrule, 
+                                      MetricValue = modelos_rf[[i]]$results$Kappa, 
+                                      Trees = i, 
+                                      Metric = "Kappa")
+        
+    } else {
+        
+        tmp <- data.frame(mtry = modelos_rf[[i]]$results$mtry, 
+                          splitrule = modelos_rf[[i]]$results$splitrule, 
+                          MetricValue = modelos_rf[[i]]$results$Kappa, 
+                          Trees = i, 
+                          Metric = "Kappa")
+        
+        datos_combinados <- rbind(datos_combinados, tmp)
+        
+    }
+}
+
+#datos_combinados$Trees <- factor(datos_combinados$Trees, levels = c("500 trees", "1000 trees", "1500 trees", "2000 trees"))
+
+datos_combinados %>%
+    # filter(splitrule == "extratrees") %>%
+    filter(Metric == "Kappa") %>%
+    ggplot(aes(x = mtry, y = MetricValue, color = Trees)) +
+    geom_point(size = 4) +
+    #scale_color_manual(values = c("#C19A6B", "#A3C9A8", "#5B9279", "#264E36")) +
+    geom_line(linetype = "dashed") +
+    theme_minimal() +
+    labs(x = "Mtry", y = "Accuracy", title = "train RF") +
+    facet_wrap(~ splitrule)
+ 
+```
+
+```{r}
+
+resample <- modelos_rf$'1000'$resample
+resample$algoritmo <- "rf"
+
+if (nrow(resamples_train) == 0){
+    
+    resamples_train <- resample
+    
+} else {
+    resamples_train <- rbind(resamples_train, resample)
+    
+}
+```
+
+```{r}
+plot(modelos_rf$'1000')
+modelos_rf$'1000'$bestTune
+```
+
+
+```{r}
+p1 <- ggplot(data = resamples_train, aes(y = Accuracy, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1,color = "#8B1A1A") +
+    geom_jitter(aes(y = Accuracy, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Accuracy",
+       x = "Accuracy", y = "") +
+    theme(legend.position = "none")
+ 
+p2 <- ggplot(data = resamples_train, aes(y = Kappa, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1, color = "#8B1A1A") +
+    geom_jitter(aes(y = Kappa, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Kappa",
+       x = "Kappa", y = "") +
+    theme(legend.position = "none")
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+#### XGboost
+
+```{r}
+modelLookup("xgbTree")
+```
+
+
+```{r,eval=FALSE}
+set.seed(1234)
+
+tune_grid <- expand.grid(
+    nrounds = seq(50, 300, 50) ,
+    max_depth = seq(2, 10, 4) ,
+    # colsample_bytree = seq(0.2, 1, 0.2),
+    # eta = seq(0.05, 0.3, 0.05),
+    # gamma = seq(0, 0.5, 0.1),
+    # min_child_weight = seq(0, 10, 2),
+    # subsample = seq(0.5, 1, 0.1)
+    colsample_bytree = 0.5,
+    eta = 0.15,
+    gamma = 0.1,
+    min_child_weight = 5,
+    subsample = 0.5
+)
+
+# Train the model
+model <- train(y=train_data_smote$Biliary_complications, x=train_data_smote[, !colnames(train_data_smote) %in% "Biliary_complications"],
+    method = "xgbTree",
+    metric = "ROC",
+    tuneGrid = tune_grid,
+    trControl = ctrl
+)
+
+plot(model)
+```
+
+```{r,eval=FALSE}
+set.seed(1234)
+
+tune_grid <- expand.grid(
+    nrounds = 150 ,
+    max_depth = 2 ,
+    colsample_bytree = seq(0.2, 1, 0.2),
+    eta = seq(0.05, 0.3, 0.05),
+    # gamma = seq(0, 0.5, 0.1),
+    # min_child_weight = seq(0, 10, 2),
+    # subsample = seq(0.5, 1, 0.1)
+    gamma = 0.1,
+    min_child_weight = 5,
+    subsample = 0.5
+)
+
+# Train the model
+model <- train(y=train_data_smote$Biliary_complications, x=train_data_smote[, !colnames(train_data_smote) %in% "Biliary_complications"],
+    method = "xgbTree",
+    metric = "ROC",
+    tuneGrid = tune_grid,
+    trControl = ctrl
+)
+
+plot(model)
+
+```
+
+```{r,eval=FALSE}
+set.seed(1234)
+
+tune_grid <- expand.grid(
+    nrounds = 150 ,
+    max_depth = 2 ,
+    colsample_bytree = 0.8,
+    eta = 0.15,
+    gamma = seq(0, 0.5, 0.1),
+    min_child_weight = seq(0, 10, 2),
+    # subsample = seq(0.5, 1, 0.1)
+    subsample = 0.5
+)
+
+# Train the model
+model <- train(y=train_data_smote$Biliary_complications, x=train_data_smote[, !colnames(train_data_smote) %in% "Biliary_complications"],
+    method = "xgbTree",
+    metric = "ROC",
+    tuneGrid = tune_grid,
+    trControl = ctrl
+)
+
+plot(model)
+
+```
+
+```{r,eval=FALSE}
+set.seed(1234)
+
+tune_grid <- expand.grid(
+    nrounds = 150 ,
+    max_depth = 2 ,
+    colsample_bytree = 0.8,
+    eta = 0.15,
+    gamma = 0,
+    min_child_weight = 0,
+    subsample = seq(0.5, 1, 0.1)
+)
+
+# Train the model
+model.xgb <- train(y=train_data_smote$Biliary_complications, x=train_data_smote[, !colnames(train_data_smote) %in% "Biliary_complications"],
+    method = "xgbTree",
+    metric = "ROC",
+    tuneGrid = tune_grid,
+    trControl = ctrl
+)
+
+saveRDS(model.xgb, "../../RDSs/paper/modelos_predictivos/model_Biliary_complications_xgb_10cv10rep_maaslin.RDS")
+```
+
+```{r}
+model.xgb <- readRDS("../../RDSs/paper/modelos_predictivos/model_Biliary_complications_xgb_10cv10rep_maaslin.RDS")
+resample <- model.xgb$resample
+resample$algoritmo <- "xgb"
+
+if (nrow(resamples_train) == 0){
+    
+    resamples_train <- resample
+    
+} else {
+    resamples_train <- rbind(resamples_train, resample)
+    
+}
+```
+
+```{r}
+plot(model.xgb)
+model.xgb$bestTune
+```
+
+```{r}
+p1 <- ggplot(data = resamples_train, aes(y = Accuracy, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1,color = "#8B1A1A") +
+    geom_jitter(aes(y = Accuracy, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Accuracy",
+       x = "Accuracy", y = "") +
+    theme(legend.position = "none")
+ 
+p2 <- ggplot(data = resamples_train, aes(y = Kappa, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1, color = "#8B1A1A") +
+    geom_jitter(aes(y = Kappa, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Kappa",
+       x = "Kappa", y = "") +
+    theme(legend.position = "none")
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+#### SVM linear
+
+```{r,eval=FALSE}
+set.seed(1234)
+
+mygrid <- expand.grid(C = c(0.01, 0.1, 1, 10))
+
+model.svmlinear <- train(Biliary_complications~ ., data=train_data_smote, 
+               method = "svmLinear",
+               metric = "ROC",
+               trControl = ctrl,
+               tuneGrid = mygrid
+               )
+
+saveRDS(model.svmlinear, "../../RDSs/paper/modelos_predictivos/model_Biliary_complications_svml_10cv10rep_maaslin.RDS")
+```
+
+```{r}
+model.svmlinear <- readRDS("../../RDSs/paper/modelos_predictivos/model_Biliary_complications_svml_10cv10rep_maaslin.RDS")
+
+resample <- model.svmlinear$resample
+resample$algoritmo <- "svm lineal"
+
+if (nrow(resamples_train) == 0){
+    
+    resamples_train <- resample
+    
+} else {
+    resamples_train <- rbind(resamples_train, resample)
+    
+}
+```
+
+```{r}
+plot(model.svmlinear)
+model.svmlinear$bestTune
+```
+
+
+```{r}
+p1 <- ggplot(data = resamples_train, aes(y = Accuracy, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1,color = "#8B1A1A") +
+    geom_jitter(aes(y = Accuracy, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Accuracy",
+       x = "Accuracy", y = "") +
+    theme(legend.position = "none")
+ 
+p2 <- ggplot(data = resamples_train, aes(y = Kappa, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1, color = "#8B1A1A") +
+    geom_jitter(aes(y = Kappa, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Kappa",
+       x = "Kappa", y = "") +
+    theme(legend.position = "none")
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+#### SVM Radial
+
+```{r,eval=FALSE}
+set.seed(1234)
+
+mygrid <- expand.grid(C = c(0.001, 0.01, 0.1, 1, 10), sigma = c(0.001, 0.01, 0.1, 1, 10))
+
+model.svmradial<- train(Biliary_complications~ ., data=train_data_smote, 
+               method = "svmRadial",
+               metric = "ROC",
+               trControl = ctrl,
+               tuneGrid = mygrid
+               )
+
+saveRDS(model.svmradial, "../../RDSs/paper/modelos_predictivos/model_Biliary_complications_svmr_10cv10rep_maaslin.RDS")
+```
+
+```{r}
+model.svmradial <- readRDS("../../RDSs/paper/modelos_predictivos/model_Biliary_complications_svmr_10cv10rep_maaslin.RDS")
+
+resample <- model.svmradial$resample
+resample$algoritmo <- "svm radial"
+
+if (nrow(resamples_train) == 0){
+    
+    resamples_train <- resample
+    
+} else {
+    resamples_train <- rbind(resamples_train, resample)
+    
+}
+```
+
+```{r}
+plot(model.svmradial)
+model.svmradial$bestTune
+```
+
+
+```{r}
+p1 <- ggplot(data = resamples_train, aes(y = Accuracy, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1,color = "#8B1A1A") +
+    geom_jitter(aes(y = Accuracy, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Accuracy",
+       x = "Accuracy", y = "") +
+    theme(legend.position = "none")
+ 
+p2 <- ggplot(data = resamples_train, aes(y = Kappa, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1, color = "#8B1A1A") +
+    geom_jitter(aes(y = Kappa, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Kappa",
+       x = "Kappa", y = "") +
+    theme(legend.position = "none")
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+#### SVM Polinomial
+
+```{r}
+modelLookup(("svmPoly"))
+```
+
+
+```{r,eval=FALSE}
+set.seed(1234)
+
+mygrid <- expand.grid(C = c(0.001, 0.01, 0.1, 1, 10), 
+                      degree = seq(2, 4, 1),
+                      scale = seq(0.001, 0.05, 0.01))
+
+model.svmpoly<- train(Biliary_complications~ ., data=train_data_smote, 
+               method = "svmPoly",
+               metric = "ROC",
+               trControl = ctrl,
+               tuneGrid = mygrid
+               )
+
+saveRDS(model.svmpoly, "../../RDSs/paper/modelos_predictivos/model_Biliary_complications_svmp_10cv10rep_maaslin.RDS")
+```
+
+```{r}
+model.svmpoly <- readRDS("../../RDSs/paper/modelos_predictivos/model_Biliary_complications_svmp_10cv10rep_maaslin.RDS")
+
+resample <- model.svmpoly$resample
+resample$algoritmo <- "svm polinomial"
+
+if (nrow(resamples_train) == 0){
+    
+    resamples_train <- resample
+    
+} else {
+    resamples_train <- rbind(resamples_train, resample)
+    
+}
+```
+
+```{r}
+plot(model.svmpoly)
+model.svmpoly$bestTune
+```
+
+
+```{r}
+p1 <- ggplot(data = resamples_train, aes(y = Accuracy, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1,color = "#8B1A1A") +
+    geom_jitter(aes(y = Accuracy, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Accuracy",
+       x = "Accuracy", y = "") +
+    theme(legend.position = "none")
+ 
+p2 <- ggplot(data = resamples_train, aes(y = Kappa, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1, color = "#8B1A1A") +
+    geom_jitter(aes(y = Kappa, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Kappa",
+       x = "Kappa", y = "") +
+    theme(legend.position = "none")
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+#### MLP
+
+```{r}
+modelLookup("mlpWeightDecay")
+```
+
+```{r, eval=FALSE}
+set.seed(1234)
+
+mygrid <- expand.grid(size = seq(1, 10, 1), 
+                      decay = c(0.0001, 0.001, 0.01, 0.1, 1))
+
+model.mlp<- train(Biliary_complications~ ., data=train_data_smote, 
+               method = "mlpWeightDecay",
+               metric = "ROC",
+               trControl = ctrl,
+               tuneGrid = mygrid
+               )
+
+saveRDS(model.mlp, "../../RDSs/paper/modelos_predictivos/model_Biliary_complications_mlp_10cv10rep_maaslin.RDS")
+```
+
+```{r}
+model.mlp <- readRDS("../../RDSs/paper/modelos_predictivos/model_Biliary_complications_mlp_10cv10rep_maaslin.RDS")
+
+resample <- model.mlp$resample
+resample$algoritmo <- "mlpWeightDecay"
+
+if (nrow(resamples_train) == 0){
+    
+    resamples_train <- resample
+     
+} else {
+    resamples_train <- rbind(resamples_train, resample)
+    
+}
+```
+
+```{r}
+plot(model.mlp)
+model.mlp$bestTune
+```
+
+
+```{r}
+p1 <- ggplot(data = resamples_train, aes(y = Accuracy, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1,color = "#8B1A1A") +
+    geom_jitter(aes(y = Accuracy, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Accuracy",
+       x = "Accuracy", y = "") +
+    theme(legend.position = "none")
+ 
+p2 <- ggplot(data = resamples_train, aes(y = Kappa, x = algoritmo, fill = algoritmo)) +
+  geom_boxplot(size = 1, color = "#8B1A1A") +
+    geom_jitter(aes(y = Kappa, x = algoritmo), size = 0.5, width = 0.1, height = 0) +
+  theme_minimal() +
+  labs(title = "Kappa",
+       x = "Kappa", y = "") +
+    theme(legend.position = "none")
+
+grid.arrange(p1, p2, ncol = 1)
+```
+
+
+#### Prediction
+
+```{r}
+probs_glm <- predict(model.glm, testSet, type = "prob")[, 2]
+
+probs_nb <- predict(model.nb, testSet, type = "prob")[, 2]
+
+probs_kknn<- predict(model.kknn, testSet, type = "prob")[, 2]
+
+probs_rf<- predict(modelos_rf$`1000`, testSet, type = "prob")[, 2]
+
+probs_xgb <- predict(model.xgb, testSet, type = "prob")[, 2]
+
+probs_svmlinear<- predict(model.svmlinear, testSet, type = "prob")[, 2]
+
+probs_svmpoly<- predict(model.svmpoly, testSet, type = "prob")[, 2]
+
+probs_svmradial<- predict(model.svmradial, testSet, type = "prob")[, 2]
+
+probs_mlp<- predict(model.mlp, testSet, type = "prob")[, 2]
+```
+
+```{r}
+library(pROC)
+
+# Calcula las curvas ROC para cada modelo
+roc_glm <- roc(testSet$Biliary_complications, probs_glm, levels = rev(levels(testSet$Biliary_complications)))
+roc_nb <- roc(testSet$Biliary_complications, probs_nb, levels = rev(levels(testSet$Biliary_complications)))
+roc_kknn <- roc(testSet$Biliary_complications, probs_kknn, levels = rev(levels(testSet$Biliary_complications)))
+roc_rf <- roc(testSet$Biliary_complications, probs_rf, levels = rev(levels(testSet$Biliary_complications)))
+roc_xgb <- roc(testSet$Biliary_complications, probs_xgb, levels = rev(levels(testSet$Biliary_complications)))
+roc_svmlinear <- roc(testSet$Biliary_complications, probs_svmlinear, levels = rev(levels(testSet$Biliary_complications)))
+roc_svmpoly <- roc(testSet$Biliary_complications, probs_svmpoly, levels = rev(levels(testSet$Biliary_complications)))
+roc_svmradial <- roc(testSet$Biliary_complications, probs_svmradial, levels = rev(levels(testSet$Biliary_complications)))
+roc_mlp <- roc(testSet$Biliary_complications, probs_mlp, levels = rev(levels(testSet$Biliary_complications)))
+```
+
+
+```{r}
+# Crear una lista con las curvas ROC
+roc_list <- list(
+  GLM = roc_glm,
+  "Naive Bayes" = roc_nb,
+  kNN = roc_kknn,
+  "Random Forest" = roc_rf,
+  XGBoost = roc_xgb,
+  "SVM Linear" = roc_svmlinear,
+  "SVM Polynomial" = roc_svmpoly,
+  "SVM Radial" = roc_svmradial,
+  MLP = roc_mlp
+)
+
+# Convertir las curvas en un formato adecuado para ggroc
+aucs_biliary <- ggroc(roc_list) +
+    geom_line(size = 0.5) + 
+    geom_abline(slope = 1, intercept = 1, linetype = "dashed", color = "gray") +
+    scale_color_manual(values = paletteer::paletteer_d("ggsci::planetexpress_futurama")) +
+      theme_minimal() +
+      labs(
+        title = "ROC Curves for Multiple Models",
+        x = "1 - Specificity",
+        y = "Sensitivity",
+        color = "Model"
+      ) +
+      theme(
+        text = element_text(size = 12)
+      )
+
+aucs_biliary
+```
+
+```{r}
+auc_values_biliary <- c(
+  GLM = auc(roc_glm),
+  Naive_Bayes = auc(roc_nb),
+  kNN = auc(roc_kknn),
+  Random_Forest = auc(roc_rf),
+  XGBoost = auc(roc_xgb),
+  SVM_Linear = auc(roc_svmlinear),
+  SVM_Poly = auc(roc_svmpoly),
+  SVM_Radial = auc(roc_svmradial),
+  MLP = auc(roc_mlp)
+)
+
+# Mostrar los AUC
+print("AUC de los modelos:")
+print(sort(auc_values_biliary, decreasing = TRUE))
+```
+
+# Guardar / cargar 
+
+```{r}
+#save.image("../../Rdatas/predicciones_genus.RData")
+#save.image("../../Rdatas/predicciones_genus_10cv10rep_maaslin.RData")
+```
+
+```{r}
+#load("../../Rdatas/predicciones_genus.RData") # Esto es la imagen de 3 rep 10cv
+# load("../../Rdatas/predicciones_genus_20cv20rep_maaslin.RData") # Esto es la imagen de 20 rep 5cv
+# load("../../Rdatas/predicciones_genus_10cv10rep_maaslin.RData") # Esto es la imagen de 20 rep 5cv
+```
+
+```{r, fig.width=6, fig.height= 12}
+aucs_aht2 <- aucs_aht +
+    theme(
+        legend.position = "none",
+        text = element_text(size = 10)
+    ) +
+    labs(title = "Hepatic arterial thrombosis")
+aucs_ar2 <- aucs_ar +
+    theme(
+        legend.position = "none",
+        text = element_text(size = 10)
+    ) +
+    labs(title = "Acute rejection")
+aucs_biliary2 <- aucs_biliary + 
+    theme(
+        legend.position = "none",
+        text = element_text(size = 10)
+    ) +
+    labs(title = "Biliary complications")
+aucs_survival2 <- aucs_survival + 
+    theme(
+        legend.position = "top",
+        text = element_text(size = 10)
+    ) +
+    labs(title = "Survival")
+
+cowplot::plot_grid(plotlist = list(aucs_survival2, aucs_ar2, aucs_aht2, aucs_biliary2), ncol = 1, rel_heights = c(1.25, 1, 1, 1))
+```

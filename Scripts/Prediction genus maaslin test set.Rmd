@@ -1,0 +1,370 @@
+---
+title: "Prediction genus testset"
+author: "Fernando Lucas Ruiz (fernando.lucas@um.es)"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    df_print: paged
+    highlight: kate
+    number_sections: true
+    theme: spacelab
+    toc: true
+    toc_float: true
+    code_folding: "hide"
+  pdf_document:
+    toc: true
+subtitle: Cirugía digestiva, endocrina y trasplante de órganos abdominales (IMIB)
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = T, warning = F, message = F)
+```
+
+```{r, warning=FALSE, message=FALSE}
+library(caret)
+library(smotefamily)
+```
+
+```{r, warning=FALSE, message=FALSE}
+source("../Librerias.R")
+source("../utils.R")
+```
+
+```{r}
+tse <- readRDS("../../RDSs/paper/tse_testset_ajustado.RDS")
+```
+
+```{r}
+tse_testset <- agglomerateByRank(tse, rank = "Genus")
+
+# Transform count assay to relative abundances
+tse_testset <- transformAssay(tse_testset, assay.type = "counts", method = "relabundance")
+```
+
+# AR
+
+```{r}
+df_testset <- assay(tse_testset, "relabundance")
+
+# Añadir la variables de salida
+df_testset <- df_testset |> 
+    t()|> 
+    as.data.frame()
+
+df_testset$AR <- colData(tse_testset)$AR 
+
+df_testset <- drop_na(df_testset)
+
+testSet <- df_testset 
+
+table(df_testset$AR)
+```
+
+## maaslin
+
+```{r, warning=FALSE, message=FALSE}
+model.glm <- readRDS("../../RDSs/paper/modelos_predictivos/model_AR_glm_10cv10rep_maaslin.RDS")
+modelos_rf <- readRDS("../../RDSs/paper/modelos_predictivos/model_AR_rf_10cv10rep_maaslin.RDS")
+model.xgb <- readRDS("../../RDSs/paper/modelos_predictivos/model_AR_xgb_10cv10rep_maaslin.RDS")
+```
+
+```{r}
+# 1. Obtener las variables que el modelo espera
+vars_modelo <- names(model.glm$trainingData)[-1]  # Variables usadas en el entrenamiento
+
+# 2. Identificar las variables que faltan en testSet
+vars_faltantes <- setdiff(vars_modelo, names(testSet))  # Variables en el modelo que no están en testSet
+vars_faltantes
+# 3. Rellenar las variables faltantes con 0
+for (var in vars_faltantes) {
+  testSet[[var]] <- 0
+}
+
+# 4. Asegurar el mismo orden de columnas que el modelo espera
+testSet <- testSet[, vars_modelo]
+
+
+testSet$AR <- df_testset$AR
+```
+
+#### Prediction
+
+```{r}
+probs_rf<- predict(modelos_rf$`500`, testSet, type = "prob")[, 2]
+
+probs_xgb <- predict(model.xgb, testSet, type = "prob")[, 2]
+```
+
+```{r}
+library(pROC)
+
+roc_rf <- roc(testSet$AR, probs_rf, levels = rev(levels(testSet$AR)))
+roc_xgb <- roc(testSet$AR, probs_xgb, levels = rev(levels(testSet$AR)))
+```
+
+```{r}
+auc_values_survival <- c(
+  Random_Forest = auc(roc_rf),
+  XGBoost = auc(roc_xgb)
+)
+
+# Mostrar los AUC
+print("AUC de los modelos:")
+print(sort(auc_values_survival, decreasing = TRUE))
+```
+
+```{r, fig.width=8, fig.height=6}
+# Crear una lista con las curvas ROC
+roc_list <- list(
+  "Random Forest" = roc_rf,
+  XGBoost = roc_xgb
+)
+
+model_labels <- paste0(names(auc_values_survival), " (AUC=", round(auc_values_survival, 2), ")")
+
+colores <- c(#"grey80", "#C71000FF",  "#008EA0FF", 
+             "#FF6348F0",  "#5A9599FF"
+             # "#8A4198FF", "#84D7E1FF", "#FF95A8FF", "#3D3B25FF"
+             )
+
+# Convertir las curvas en un formato adecuado para ggroc
+aucs_survival <- ggroc(roc_list) +
+    geom_line(size = 2) + 
+    geom_abline(slope = 1, intercept = 1, linetype = "dashed", color = "gray") +
+    scale_color_manual(values = colores,
+                       labels = model_labels) +
+      theme_minimal() +
+      labs(
+        x = "1 - Specificity",
+        y = "Sensitivity",
+        color = "Model"
+      ) +
+    theme(
+        text = element_text(size = 20),
+        legend.position = "bottom",
+        legend.title = element_blank(),
+        legend.text = element_text(size = 14)
+    ) +
+    guides(
+        color = guide_legend(
+        ncol = 3,
+        override.aes = list(size = 10)  
+        )
+    )
+
+aucs_survival
+```
+
+```{r}
+set.seed(1234)
+pred_rf<- predict(modelos_rf$`500`, testSet)
+
+pred_xgb <- predict(model.xgb, testSet)
+```
+
+```{r, fig.width=8, fig.height=4}
+conf_list <- list(
+    "Random Forest" = pred_rf,
+    XGBoost = pred_xgb
+)
+
+plots <- list()
+
+for (i in names(conf_list)){
+    conf_matrix <- confusionMatrix(conf_list[[i]], testSet$AR)
+    
+    
+    cm_df <- as.data.frame(conf_matrix$table)
+    cm_df$match <- ifelse(cm_df$Prediction == cm_df$Reference, cm_df$Freq, -cm_df$Freq)  
+    p <- ggplot(cm_df, aes(x = factor(Prediction, levels = c("NO", "YES")),  
+                            y = factor(Reference, levels = c("YES", "NO")),  
+                            fill = match)) +  
+        geom_tile() +  
+        geom_text(aes(label = Freq), color = "black", size = 4) +
+        scale_fill_gradient2(low = "#CD3333", mid = "white", high = "darkseagreen1", 
+                             midpoint = 0) +  # 0 es el punto medio entre errores/aciertos
+        labs(
+            title = i, 
+            subtitle = paste0("Balanced Accuracy: ", round(conf_matrix$byClass[["Balanced Accuracy"]], 2),
+                              "\nF1-score: ", round(conf_matrix$byClass[["F1"]], 2),
+                              "     Specifity: ", round(conf_matrix$byClass[["Specificity"]], 2)),
+            x = "Predict", 
+            y = "Real"
+        ) +
+        theme_minimal() + 
+        theme(
+            legend.position = "none",  # Mostrar la leyenda para ver la escala de colores
+            plot.margin = margin(20,20,20,20)
+        )
+
+    
+    plots[[i]] <- p
+    
+}
+    
+cowplot::plot_grid(plotlist = plots)
+```
+
+# Survival
+
+```{r}
+df_testset <- assay(tse_testset, "relabundance")
+
+# Añadir la variables de salida
+df_testset <- df_testset |> 
+    t()|> 
+    as.data.frame()
+
+df_testset$Survival <- colData(tse_testset)$Survival 
+
+df_testset <- drop_na(df_testset)
+
+testSet <- df_testset 
+
+table(df_testset$Survival)
+```
+
+## maaslin
+
+```{r, warning=FALSE, message=FALSE}
+model.glm <- readRDS("../../RDSs/paper/modelos_predictivos/model_Survival_glm_10cv10rep_maaslin.RDS")
+modelos_rf <- readRDS("../../RDSs/paper/modelos_predictivos/model_Survival_rf_10cv10rep_maaslin.RDS")
+model.xgb <- readRDS("../../RDSs/paper/modelos_predictivos/model_Survival_xgb_10cv10rep_maaslin.RDS")
+```
+
+```{r}
+# 1. Obtener las variables que el modelo espera
+vars_modelo <- names(model.glm$trainingData)[-1]  # Variables usadas en el entrenamiento
+
+# 2. Identificar las variables que faltan en testSet
+vars_faltantes <- setdiff(vars_modelo, names(testSet))  # Variables en el modelo que no están en testSet
+vars_faltantes
+# 3. Rellenar las variables faltantes con 0
+for (var in vars_faltantes) {
+  testSet[[var]] <- 0
+}
+
+# 4. Asegurar el mismo orden de columnas que el modelo espera
+testSet <- testSet[, vars_modelo]
+testSet$Survival <- df_testset$Survival
+```
+
+
+#### Prediction
+
+```{r}
+probs_rf<- predict(modelos_rf$`500`, testSet, type = "prob")[, 2]
+
+probs_xgb <- predict(model.xgb, testSet, type = "prob")[, 2]
+```
+
+```{r}
+library(pROC)
+
+roc_rf <- roc(testSet$Survival, probs_rf, levels = rev(levels(testSet$Survival)))
+roc_xgb <- roc(testSet$Survival, probs_xgb, levels = rev(levels(testSet$Survival)))
+```
+
+```{r}
+auc_values_survival <- c(
+  Random_Forest = auc(roc_rf),
+  XGBoost = auc(roc_xgb)
+)
+
+# Mostrar los AUC
+print("AUC de los modelos:")
+print(sort(auc_values_survival, decreasing = TRUE))
+```
+
+```{r, fig.width=8, fig.height=6}
+# Crear una lista con las curvas ROC
+roc_list <- list(
+  "Random Forest" = roc_rf,
+  XGBoost = roc_xgb
+)
+
+model_labels <- paste0(names(auc_values_survival), " (AUC=", round(auc_values_survival, 2), ")")
+
+colores <- c(#"grey80", "#C71000FF",  "#008EA0FF", 
+             "#FF6348F0",  "#5A9599FF"
+             # "#8A4198FF", "#84D7E1FF", "#FF95A8FF", "#3D3B25FF"
+             )
+
+# Convertir las curvas en un formato adecuado para ggroc
+aucs_survival <- ggroc(roc_list) +
+    geom_line(size = 2) + 
+    geom_abline(slope = 1, intercept = 1, linetype = "dashed", color = "gray") +
+    scale_color_manual(values = colores,
+                       labels = model_labels) +
+      theme_minimal() +
+      labs(
+        x = "1 - Specificity",
+        y = "Sensitivity",
+        color = "Model"
+      ) +
+    theme(
+        text = element_text(size = 20),
+        legend.position = "bottom",
+        legend.title = element_blank(),
+        legend.text = element_text(size = 14)
+    ) +
+    guides(
+        color = guide_legend(
+        ncol = 3,
+        override.aes = list(size = 10)  
+        )
+    )
+
+aucs_survival
+```
+
+```{r}
+set.seed(1234)
+pred_rf<- predict(modelos_rf$`500`, testSet)
+
+pred_xgb <- predict(model.xgb, testSet)
+```
+
+```{r, fig.width=8, fig.height=4}
+conf_list <- list(
+    "Random Forest" = pred_rf,
+    XGBoost = pred_xgb
+)
+
+plots <- list()
+
+for (i in names(conf_list)){
+    conf_matrix <- confusionMatrix(conf_list[[i]], testSet$Survival)
+    
+    
+    cm_df <- as.data.frame(conf_matrix$table)
+    cm_df$match <- ifelse(cm_df$Prediction == cm_df$Reference, cm_df$Freq, -cm_df$Freq)  
+    p <- ggplot(cm_df, aes(x = factor(Prediction, levels = c("NO", "YES")),  
+                            y = factor(Reference, levels = c("YES", "NO")),  
+                            fill = match)) +  
+        geom_tile() +  
+        geom_text(aes(label = Freq), color = "black", size = 4) +
+        scale_fill_gradient2(low = "#CD3333", mid = "white", high = "darkseagreen1", 
+                             midpoint = 0) +  # 0 es el punto medio entre errores/aciertos
+        labs(
+            title = i, 
+            subtitle = paste0("Balanced Accuracy: ", round(conf_matrix$byClass[["Balanced Accuracy"]], 2),
+                              "\nF1-score: ", round(conf_matrix$byClass[["F1"]], 2),
+                              "     Specificity: ", round(conf_matrix$byClass[["Specificity"]], 2)),
+            x = "Predict", 
+            y = "Real"
+        ) +
+        theme_minimal() + 
+        theme(
+            legend.position = "none",  # Mostrar la leyenda para ver la escala de colores
+            plot.margin = margin(20,20,20,20)
+        )
+
+    
+    plots[[i]] <- p
+    
+}
+    
+cowplot::plot_grid(plotlist = plots)
+```
+
